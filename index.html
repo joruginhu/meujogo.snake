@@ -16,6 +16,8 @@
     background:repeating-linear-gradient(to bottom, rgba(0,0,0,.075) 0 1px, rgba(0,0,0,0) 1px 3px);}
   canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;touch-action:none;}
   #hint{position:fixed;bottom:5px;left:0;right:0;text-align:center;font-size:10px;letter-spacing:2px;opacity:.35;}
+  #nameIn{position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;border:0;padding:0;margin:0;
+    font-size:16px;user-select:text;-webkit-user-select:text;pointer-events:none;}
 </style>
 </head>
 <body>
@@ -25,6 +27,7 @@
   </div>
 </div>
 <div id="hint">SNAKE.IO</div>
+<input id="nameIn" type="text" maxlength="10" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" aria-label="Nome"/>
 <script>
 (function(){
 'use strict';
@@ -107,10 +110,16 @@ for(const k in FONT_RAW){ FONT_ROWS[k] = FONT_RAW[k].split(','); }
    ============================================================ */
 const cv = document.getElementById('screen');
 const ctx = cv.getContext('2d', {alpha:false});
+const nameEl = document.getElementById('nameIn');
 const BEZEL = 24;
 let W = 240, H = 180, SCALE = 3;
+let playerName = '';
+
+function getName(){ return playerName.trim() || 'VOCE'; }
 
 function resize(){
+  // não redimensiona enquanto o teclado está aberto no menu
+  if(document.activeElement === nameEl && mode === 'menu') return;
   const aw = Math.max(200, window.innerWidth - BEZEL);
   const ah = Math.max(160, window.innerHeight - BEZEL);
   let s = Math.round(Math.min(aw / 300, ah / 230));
@@ -237,23 +246,24 @@ function sfxStart(){ beep(520, 0.06, 0.03); setTimeout(function(){ beep(780, 0.0
    CONFIG
    ============================================================ */
 const CFG = {
-  R: 470,             // raio da arena
+  R: 900,             // raio da arena
   SEG: 2.0,           // espaçamento entre nós do corpo
   SPEED: 46,
   BOOST_MULT: 1.9,
   TURN: 3.7,
   TURN_BOOST: 2.5,
-  FOOD_MAX: 300,
+  FOOD_MAX: 1000,
   START_MASS: 12,
   NPM: 1.5,
   MAX_NODES: 420,
-  AI: 11,
+  AI: 30,
   R_HEAD: 3,
   R_BODY: 3,
   BOOST_COST: 15
 };
 
-const AI_NAMES = ['VIPER','KOBRA','MAMBA','PITON','TAIPAN','NAJA','SUCURI','JARARA','CASCAVEL','BOA','ANACONDA','CASCABEL','CORAL','DRAGAO','FURIA','ZUMBI'];
+const AI_NAMES = ['VIPER','KOBRA','MAMBA','PITON','TAIPAN','NAJA','SUCURI','JARARA','CASCAVEL','BOA','ANACONDA','CASCABEL','CORAL','DRAGAO','FURIA','ZUMBI',
+                  'JIBOIA','URUTU','BOIUNA','SERPE','VENENO','SOMBRA','RAIO','TROVAO','LOBO','TIGRE','ONCA','FALCAO','NINJA','REI','HYDRA','COBRAO','VESPA','ESCAMA','FOGO','GELO','NEON','TURBO','BRUTO','GIGANTE','MINI','FLASH','ZERO'];
 const AI_SHADES = ['#42561a','#4d5a12','#3b5220','#556019','#48602a'];
 const PLAYER_COLOR = '#1f2b06';
 
@@ -267,12 +277,18 @@ let deadT = 0, flash = 0, killMsg = 0, killMsgText = '';
 let best = 0, tclock = 0, lastFrame = 0;
 const cam = {x:0, y:0};
 let nextAiName = 0;
+let difficulty = 1;      // 0 fácil | 1 médio | 2 difícil
 
 /* ============================================================
    SNAKE
    ============================================================ */
 function nodesFor(mass){
   return Math.max(10, Math.min(CFG.MAX_NODES, Math.round(mass * CFG.NPM)));
+}
+
+/* largura da cobra cresce com a massa (como no slither.io) */
+function radiusFor(mass){
+  return Math.min(9, 3 + Math.floor(Math.sqrt(Math.max(0, mass - 12)) / 2.4));
 }
 
 function makeSnake(o){
@@ -284,6 +300,7 @@ function makeSnake(o){
     angle: o.angle,
     targetAngle: o.angle,
     mass: o.mass,
+    r: radiusFor(o.mass),
     path: [],
     boosting: false,
     dead: false,
@@ -291,7 +308,12 @@ function makeSnake(o){
     tx: o.x, ty: o.y,
     chasing: false,
     bbox: {x0:0, y0:0, x1:0, y1:0},
-    dropT: 0
+    dropT: 0,
+    turnMul: 1,
+    state: 'wander', prey: null, threat: null,
+    err: 0, phase: Math.random() * 6.28,
+    stratT: Math.random() * 0.8, steerT: Math.random() * 0.1,
+    desAngle: o.angle, blind: 0, boostT: 0, boostCool: 0
   };
   const n = nodesFor(o.mass);
   for(let i = 0; i < n; i++){
@@ -307,10 +329,46 @@ function randPoint(maxD){
   return { x: Math.cos(a) * d, y: Math.sin(a) * d };
 }
 
+/* tamanhos variados: pequenas, médias, grandes e gigantes */
+function randAiMass(initial){
+  const r = Math.random();
+  if(initial){
+    if(r < 0.45) return 10 + Math.random() * 25;
+    if(r < 0.78) return 35 + Math.random() * 65;
+    if(r < 0.94) return 100 + Math.random() * 120;
+    return 220 + Math.random() * 180;
+  }
+  if(r < 0.6) return 10 + Math.random() * 20;
+  if(r < 0.9) return 30 + Math.random() * 50;
+  return 80 + Math.random() * 100;
+}
+
+/* sorteia um ponto longe de qualquer cobra viva */
+function safePoint(maxD, clear){
+  const c2 = clear * clear;
+  let p = randPoint(maxD);
+  for(let t = 0; t < 40; t++){
+    p = randPoint(maxD);
+    let ok = true;
+    for(let k = 0; k < snakes.length && ok; k++){
+      const o = snakes[k];
+      if(o.dead) continue;
+      for(let i = 0; i < o.path.length; i += 3){
+        const dx = o.path[i].x - p.x, dy = o.path[i].y - p.y;
+        if(dx * dx + dy * dy < c2){ ok = false; break; }
+      }
+    }
+    if(ok) return p;
+  }
+  return p;
+}
+
 function spawnAI(initial){
-  const p = randPoint(CFG.R * 0.82);
-  const angle = Math.random() * Math.PI * 2;
-  const mass = initial ? 10 + Math.random() * 45 : 12 + Math.random() * 14;
+  const mass = randAiMass(initial);
+  const maxD = CFG.R * (mass > 150 ? 0.6 : 0.82);
+  const p = initial ? randPoint(maxD) : safePoint(maxD, 40);
+  // cabeça aponta para fora, então o corpo fica para o lado do centro
+  const angle = Math.atan2(p.y, p.x) + (Math.random() - 0.5) * 1.2;
   const name = AI_NAMES[(nextAiName++) % AI_NAMES.length];
   const s = makeSnake({
     name: name,
@@ -320,14 +378,15 @@ function spawnAI(initial){
     mass: mass,
     isPlayer: false
   });
+  s.turnMul = DIFF[difficulty].turn;
   snakes.push(s);
   return s;
 }
 
 function spawnPlayer(){
-  const p = randPoint(CFG.R * 0.6);
+  const p = safePoint(CFG.R * 0.6, 80);
   player = makeSnake({
-    name: 'VOCE',
+    name: getName(),
     color: PLAYER_COLOR,
     x: p.x, y: p.y,
     angle: Math.random() * Math.PI * 2,
@@ -374,9 +433,35 @@ function inTurbo(x, y){
   return x >= b.x - 6 && x <= b.x + b.s + 6 && y >= b.y - 6 && y <= b.y + b.s + 6;
 }
 
+/* ---------- campo de nome (input oculto + desenho no canvas) ---------- */
+nameEl.addEventListener('input', function(){
+  let v = nameEl.value.toUpperCase().replace(/[^A-Z0-9 .\-]/g, '').replace(/^\s+/, '');
+  v = v.slice(0, 10);
+  if(v !== nameEl.value) nameEl.value = v;
+  playerName = v;
+});
+nameEl.addEventListener('blur', function(){ resize(); });
+
+function focusName(){
+  try{ nameEl.focus({preventScroll:true}); }catch(e){ nameEl.focus(); }
+}
+
+function closeGame(){
+  try{ window.close(); }catch(e){}
+  // se o navegador não permitir fechar a aba, sai para uma página em branco
+  setTimeout(function(){
+    try{ window.location.replace('about:blank'); }catch(e){}
+  }, 150);
+}
+
+function hitRect(p, x, y, w, h){
+  return p.x >= x && p.x <= x + w && p.y >= y && p.y <= y + h;
+}
+
 cv.addEventListener('pointerdown', function(e){
   initAudio();
   if(e.pointerType === 'touch') touchMode = true;
+  if(mode === 'menu' || mode === 'dead') return;   // menu e tela de morte usam 'click'
   const p = canvasPos(e);
   if(touchMode && inTurbo(p.x, p.y)){
     turboHeld = true; boostId = e.pointerId;
@@ -385,9 +470,37 @@ cv.addEventListener('pointerdown', function(e){
     pointer.x = p.x; pointer.y = p.y; pointer.active = true;
     if(e.pointerType !== 'touch') pointer.down = true;
   }
-  pressStart();
   e.preventDefault();
 }, {passive:false});
+
+cv.addEventListener('click', function(e){
+  initAudio();
+  const p = canvasPos(e);
+  if(mode === 'dead'){
+    if(deadT < 0.8) return;
+    const D = deadLayout();
+    if(hitRect(p, D.bx, D.retryY, D.bw, D.bh)) startGame();
+    else if(hitRect(p, D.bx, D.menuY, D.bw, D.bh)) goMenu();
+    return;
+  }
+  if(mode !== 'menu') return;
+  const L = menuLayout();
+  for(let i = 0; i < 3; i++){
+    if(hitRect(p, L.dRowX + i * (L.dBtnW + 2), L.py + L.dRowY, L.dBtnW, 13)){
+      setDifficulty(i);
+      return;
+    }
+  }
+  if(hitRect(p, L.bx, L.py + L.fieldY, L.bw, 13)){
+    focusName();
+  } else if(hitRect(p, L.bx, L.py + L.playY, L.bw, 13)){
+    startGame();
+  } else if(hitRect(p, L.bx, L.py + L.closeY, L.bw, 13)){
+    closeGame();
+  } else {
+    nameEl.blur();
+  }
+});
 
 cv.addEventListener('pointermove', function(e){
   if(steerId !== null && e.pointerId !== steerId) return;
@@ -405,27 +518,44 @@ cv.addEventListener('pointercancel', releasePointer);
 window.addEventListener('blur', function(){ pointer.down = false; turboHeld = false; });
 
 window.addEventListener('keydown', function(e){
+  // digitando o nome
+  if(e.target === nameEl){
+    if(e.key === 'Enter'){
+      nameEl.blur();
+      if(mode === 'menu') startGame();
+    }
+    return;
+  }
   const k = e.key.toLowerCase();
   keys[k] = true;
   initAudio();
   if(k === ' ' || k === 'arrowup' || k === 'arrowdown' || k === 'arrowleft' || k === 'arrowright') e.preventDefault();
   if(k === 'm') muted = !muted;
-  pressStart();
+  if(mode === 'menu'){
+    if(k === 'enter') startGame();
+  } else if(mode === 'dead'){
+    if(k === 'enter' && deadT > 0.8) startGame();
+    else if(k === 'escape') goMenu();
+  }
 });
 
 window.addEventListener('keyup', function(e){ keys[e.key.toLowerCase()] = false; });
 document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
 document.addEventListener('touchmove', function(e){ e.preventDefault(); }, {passive:false});
 
-function pressStart(){
-  if(mode === 'menu'){ startGame(); }
-  else if(mode === 'dead' && deadT > 0.55){ startGame(); }
+function goMenu(){
+  nameEl.blur();
+  turboHeld = false; pointer.down = false; pointer.active = false;
+  resetWorld(false);
+  mode = 'menu';
+  flash = 0; killMsg = 0;
 }
 
 /* ============================================================
    INÍCIO DE JOGO
    ============================================================ */
 function startGame(){
+  nameEl.blur();
   resetWorld(true);
   mode = 'play';
   deadT = 0;
@@ -458,7 +588,7 @@ function moveSnake(s, dt){
       }
     }
   }
-  const turn = (s.boosting ? CFG.TURN_BOOST : CFG.TURN) * dt;
+  const turn = (s.boosting ? CFG.TURN_BOOST : CFG.TURN) * (s.turnMul || 1) * dt;
   const d = angleDiff(s.targetAngle, s.angle);
   s.angle += Math.max(-turn, Math.min(turn, d));
 
@@ -472,6 +602,7 @@ function moveSnake(s, dt){
   }
   const maxN = nodesFor(s.mass);
   while(s.path.length > maxN) s.path.pop();
+  s.r = radiusFor(s.mass);
 
   // bbox
   let x0 = s.x, y0 = s.y, x1 = s.x, y1 = s.y;
@@ -503,17 +634,42 @@ function steerPlayer(dt){
 /* ============================================================
    IA
    ============================================================ */
-const LOOK = 24;
+/* parâmetros de cada dificuldade */
+const DIFF = [
+  { // FÁCIL: reage devagar, erra a mira, quase não ataca
+    reactMin:0.22, reactMax:0.40, stratMin:1.2,  stratMax:2.6,
+    noise:0.30, err:0.35, look:0.8,  aggr:0.12, hunt:0.70, boost:0.0, flee:0.35, turn:0.82, mistake:0.025 },
+  { // MÉDIO
+    reactMin:0.10, reactMax:0.18, stratMin:0.7,  stratMax:1.5,
+    noise:0.14, err:0.14, look:1.0,  aggr:0.40, hunt:0.85, boost:0.5, flee:0.75, turn:0.95, mistake:0.006 },
+  { // DIFÍCIL: reflexo rápido, corta a frente, foge de cobra maior
+    reactMin:0.04, reactMax:0.08, stratMin:0.35, stratMax:0.8,
+    noise:0.05, err:0.04, look:1.3,  aggr:0.80, hunt:1.00, boost:1.0, flee:1.0,  turn:1.0,  mistake:0 }
+];
 
+function setDifficulty(i){
+  difficulty = i;
+  for(let k = 0; k < snakes.length; k++){
+    if(!snakes[k].isPlayer) snakes[k].turnMul = DIFF[i].turn;
+  }
+  beep(500 + i * 140, 0.05, 0.02);
+}
+
+/* distância (0..1) de perigo em um ponto: corpos, cabeças e a previsão da cabeça */
 function obstaclePenalty(px, py, self){
-  let minD2 = 1e9;
+  let minD = 1e9;
   for(let k = 0; k < snakes.length; k++){
     const o = snakes[k];
     if(o === self || o.dead) continue;
     const b = o.bbox;
-    if(px < b.x0 - 16 || px > b.x1 + 16 || py < b.y0 - 16 || py > b.y1 + 16) continue;
-    const hx = o.x - px, hy = o.y - py;
-    const hd = hx * hx + hy * hy;
+    const m = 36 + o.r;
+    if(px < b.x0 - m || px > b.x1 + m || py < b.y0 - m || py > b.y1 + m) continue;
+    let minD2 = 1e9;
+    let hx = o.x - px, hy = o.y - py;
+    let hd = hx * hx + hy * hy;
+    if(hd < minD2) minD2 = hd;
+    hx = o.x + Math.cos(o.angle) * 16 - px; hy = o.y + Math.sin(o.angle) * 16 - py;
+    hd = hx * hx + hy * hy;
     if(hd < minD2) minD2 = hd;
     const step = o.path.length > 50 ? 2 : 1;
     for(let i = 0; i < o.path.length; i += step){
@@ -522,10 +678,11 @@ function obstaclePenalty(px, py, self){
       const d2 = dx * dx + dy * dy;
       if(d2 < minD2) minD2 = d2;
     }
+    const d = Math.sqrt(minD2) - (o.r - 3) - (self.r - 3);
+    if(d < minD) minD = d;
   }
-  const d = Math.sqrt(minD2);
-  if(d > 18) return 0;
-  return (18 - d) / 18;
+  if(minD > 18) return 0;
+  return Math.min(1.5, (18 - minD) / 18);
 }
 
 function wander(s){
@@ -539,58 +696,158 @@ function wander(s){
   s.tx = tx; s.ty = ty;
 }
 
-function pickAiTarget(s){
-  s.chasing = false;
-  const r = Math.random();
-  if(r < 0.52){
-    let bestD = 320 * 320, bi = -1;
-    for(let i = 0; i < food.length; i++){
-      const f = food[i];
-      const dx = f.x - s.x, dy = f.y - s.y;
-      const d2 = dx * dx + dy * dy;
-      if(d2 < bestD){ bestD = d2; bi = i; }
-    }
-    if(bi >= 0){ s.tx = food[bi].x; s.ty = food[bi].y; }
-    else wander(s);
-  } else if(r < 0.80 && player && !player.dead){
-    s.tx = player.x + Math.cos(player.angle) * 14;
-    s.ty = player.y + Math.sin(player.angle) * 14;
-    s.chasing = true;
-  } else {
-    wander(s);
+/* decisão estratégica: fugir, caçar, comer ou passear */
+function aiStrategy(s){
+  const d = DIFF[difficulty];
+  s.err = (Math.random() - 0.5) * 2 * d.err;
+  s.prey = null; s.threat = null;
+
+  const scary = [];
+  let threat = null, td = 1e9;
+  const tr = (140 + s.r * 6) * d.look;
+  for(let i = 0; i < snakes.length; i++){
+    const o = snakes[i];
+    if(o === s || o.dead || o.mass <= s.mass * 1.2) continue;
+    const dd = Math.hypot(o.x - s.x, o.y - s.y);
+    if(dd < 420) scary.push(o);
+    if(dd < tr && dd < td){ td = dd; threat = o; }
   }
+  if(threat && Math.random() < d.flee){
+    s.state = 'flee'; s.threat = threat; return;
+  }
+
+  if(Math.random() < d.aggr){
+    let bestS = 0, prey = null;
+    const lim = (260 + s.r * 8) * d.look;
+    for(let i = 0; i < snakes.length; i++){
+      const o = snakes[i];
+      if(o === s || o.dead || o.mass > s.mass * d.hunt) continue;
+      const dd = Math.hypot(o.x - s.x, o.y - s.y);
+      if(dd > lim) continue;
+      let sc = (o.mass + 20) / (dd + 40);
+      if(o.isPlayer && difficulty > 0) sc *= 1.5;
+      if(sc > bestS){ bestS = sc; prey = o; }
+    }
+    if(prey){ s.state = 'hunt'; s.prey = prey; return; }
+  }
+
+  const maxD = (230 + s.r * 8) * d.look, maxD2 = maxD * maxD;
+  let bestF = 0, bi = -1;
+  for(let i = 0; i < food.length; i++){
+    const f = food[i];
+    const dx = f.x - s.x, dy = f.y - s.y;
+    const d2 = dx * dx + dy * dy;
+    if(d2 > maxD2) continue;
+    let sc = f.m * (f.big ? 1.8 : 1) / (Math.sqrt(d2) + 25);
+    const da = Math.abs(angleDiff(Math.atan2(dy, dx), s.angle));
+    sc *= 1.25 - da * 0.22;
+    if(scary.length){
+      let bad = false;
+      for(let j = 0; j < scary.length; j++){
+        if(Math.hypot(f.x - scary[j].x, f.y - scary[j].y) < 55 + scary[j].r * 3){ bad = true; break; }
+      }
+      if(bad) continue;
+    }
+    if(sc > bestF){ bestF = sc; bi = i; }
+  }
+  if(bi >= 0){ s.state = 'food'; s.tx = food[bi].x; s.ty = food[bi].y; return; }
+  s.state = 'wander'; wander(s);
+}
+
+/* ângulo desejado conforme o estado (com ruído "humano") */
+function aiGoalAngle(s, d){
+  let tx = s.tx, ty = s.ty;
+  const st = s.state;
+  if(st === 'flee'){
+    const th = s.threat;
+    if(!th || th.dead){ s.state = 'wander'; s.stratT = 0; }
+    else {
+      const dist = Math.hypot(th.x - s.x, th.y - s.y);
+      if(dist > 300){ s.state = 'wander'; s.stratT = 0; }
+      else {
+        let ax = s.x - th.x, ay = s.y - th.y;
+        const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+        const cl = Math.hypot(s.x, s.y) || 1;
+        const w = Math.max(0, cl / CFG.R - 0.4) * 1.4;   // perto da borda, mistura com o centro
+        ax += (-s.x / cl) * w; ay += (-s.y / cl) * w;
+        tx = s.x + ax * 100; ty = s.y + ay * 100;
+        if(dist < 100 + th.r * 3 && s.mass > 24 && s.boostCool <= 0 && Math.random() < d.boost){
+          s.boostT = 0.5 + Math.random() * 0.6; s.boostCool = 2.2;
+        }
+      }
+    }
+  } else if(st === 'hunt'){
+    const pr = s.prey;
+    if(!pr || pr.dead){ s.state = 'wander'; s.stratT = 0; }
+    else {
+      const dist = Math.hypot(pr.x - s.x, pr.y - s.y);
+      if(dist > 480){ s.state = 'wander'; s.stratT = 0; }
+      else {
+        // mira à frente da cabeça da presa para cortar o caminho
+        const lead = Math.max(24, Math.min(120, dist * 0.7));
+        tx = pr.x + Math.cos(pr.angle) * lead;
+        ty = pr.y + Math.sin(pr.angle) * lead;
+        const aimErr = Math.abs(angleDiff(Math.atan2(ty - s.y, tx - s.x), s.angle));
+        if(dist > 50 && dist < 190 && aimErr < 0.5 && s.mass > 30 && s.boostCool <= 0 && Math.random() < d.boost * 0.5){
+          s.boostT = 0.5 + Math.random() * 0.7; s.boostCool = 3;
+        }
+      }
+    }
+  } else if(st === 'food'){
+    if(Math.hypot(tx - s.x, ty - s.y) < 10) s.stratT = 0;      // chegou: escolhe a próxima
+  } else {
+    if(Math.hypot(tx - s.x, ty - s.y) < 30) wander(s);
+  }
+  const sway = (st === 'hunt' || st === 'flee') ? 0.35 : 1;
+  return Math.atan2(ty - s.y, tx - s.x) + s.err + Math.sin(tclock * 1.7 + s.phase) * d.noise * sway;
+}
+
+/* escolhe a melhor direção livre perto do ângulo desejado (antenas à frente) */
+function aiSteer(s, desired, d){
+  const R = s.r;
+  const look1 = (16 + R * 2) * d.look;
+  const look2 = look1 * 2.1;
+  const wl = CFG.R - 28 - R;
+  const blind = s.blind > 0;
+  let bestScore = -1e9, bestA = s.angle;
+  for(let k = -7; k <= 7; k++){
+    const off = k * 0.22;
+    const a = s.angle + off;
+    const c = Math.cos(a), sn = Math.sin(a);
+    const x1 = s.x + c * look1, y1 = s.y + sn * look1;
+    const x2 = s.x + c * look2, y2 = s.y + sn * look2;
+    let score = -Math.abs(angleDiff(desired, a)) * 1.6 - Math.abs(off) * 0.12;
+    const b1 = Math.hypot(x1, y1), b2 = Math.hypot(x2, y2);
+    if(b1 > wl) score -= 6 + (b1 - wl) * 0.5;
+    if(b2 > wl) score -= 2 + (b2 - wl) * 0.15;
+    if(!blind){
+      score -= obstaclePenalty(x1, y1, s) * 10;
+      score -= obstaclePenalty(x2, y2, s) * 4;
+    }
+    if(score > bestScore){ bestScore = score; bestA = a; }
+  }
+  return bestA;
 }
 
 function aiThink(s, dt){
-  s.think -= dt;
-  if(s.think <= 0){
-    s.think = 0.5 + Math.random() * 1.1;
-    pickAiTarget(s);
-  }
-  const desired = Math.atan2(s.ty - s.y, s.tx - s.x);
-  const offs = [0, 0.25, -0.25, 0.55, -0.55, 0.95, -0.95, 1.5, -1.5];
-  let bestScore = -1e9, bestA = s.angle;
+  const d = DIFF[difficulty];
+  s.stratT -= dt; s.steerT -= dt;
+  if(s.blind > 0) s.blind -= dt;
+  if(s.boostCool > 0) s.boostCool -= dt;
+  if(s.boostT > 0) s.boostT -= dt;
 
-  for(let i = 0; i < offs.length; i++){
-    const a = s.angle + offs[i];
-    const px = s.x + Math.cos(a) * LOOK;
-    const py = s.y + Math.sin(a) * LOOK;
-    let score = -Math.abs(angleDiff(desired, a)) * 1.1;
-    const bd = Math.hypot(px, py);
-    if(bd > CFG.R - 30) score -= 8 + (bd - (CFG.R - 30)) * 0.8;
-    score -= obstaclePenalty(px, py, s) * 9;
-    if(i > 0) score -= 0.02;
-    if(score > bestScore){ bestScore = score; bestA = a; }
+  if(s.stratT <= 0){
+    s.stratT = d.stratMin + Math.random() * (d.stratMax - d.stratMin);
+    aiStrategy(s);
   }
-  s.targetAngle = bestA;
-
-  // turbo ocasional ao caçar
-  if(s.chasing && s.mass > 30){
-    const dd = Math.hypot(s.tx - s.x, s.ty - s.y);
-    s.boosting = dd > 60 && dd < 170 && Math.random() < 0.06;
-  } else {
-    s.boosting = false;
+  if(s.steerT <= 0){
+    s.steerT = d.reactMin + Math.random() * (d.reactMax - d.reactMin);
+    if(d.mistake && Math.random() < d.mistake) s.blind = 0.5 + Math.random() * 0.6;
+    s.desAngle = aiSteer(s, aiGoalAngle(s, d), d);
   }
+  // suaviza a mudança de direção (movimento fluido)
+  s.targetAngle += angleDiff(s.desAngle, s.targetAngle) * Math.min(1, dt * 9);
+  s.boosting = s.boostT > 0 && s.mass > 20;
 }
 
 /* ============================================================
@@ -626,7 +883,7 @@ function killSnake(s, killer){
   } else {
     respawnQ.push(1.6 + Math.random() * 2.2);
   }
-  if(food.length > 1100) food.splice(0, food.length - 1100);
+  if(food.length > 2600) food.splice(0, food.length - 2600);
 }
 
 function handleCollisions(){
@@ -641,9 +898,10 @@ function handleCollisions(){
       const o = snakes[b];
       if(o === s || o.dead) continue;
       const bb = o.bbox;
-      if(s.x < bb.x0 - 8 || s.x > bb.x1 + 8 || s.y < bb.y0 - 8 || s.y > bb.y1 + 8) continue;
+      const th = s.r + o.r - 1;
+      const mg = th + 2;
+      if(s.x < bb.x0 - mg || s.x > bb.x1 + mg || s.y < bb.y0 - mg || s.y > bb.y1 + mg) continue;
 
-      const th = hr + CFG.R_BODY - 1;
       const th2 = th * th;
       const hdx = o.x - s.x, hdy = o.y - s.y;
       if(hdx * hdx + hdy * hdy < th2){ killSnake(s, o); break; }
@@ -665,7 +923,7 @@ function updateFood(dt){
   for(let i = 0; i < snakes.length; i++){
     const s = snakes[i];
     if(s.dead) continue;
-    const rr = CFG.R_HEAD + 3.2;
+    const rr = s.r + 3.2;
     const rr2 = rr * rr;
     for(let j = food.length - 1; j >= 0; j--){
       const f = food[j];
@@ -805,7 +1063,7 @@ function circleRing(cx, cy, rOut, rIn, color){
 
 function drawArena(){
   ctx.fillStyle = outPattern;
-  ctx.fillRect(0, 0, W, H);
+  ctx.fillRect(-6, -6, W + 12, H + 12);
   const ax = sx(0), ay = sy(0);
   circleRing(ax, ay, CFG.R, CFG.R - 4, PAL.DARK);
   fillCircle(ax, ay, CFG.R - 4, PAL.BG);
@@ -845,32 +1103,50 @@ function drawFood(){
 
 function drawSnake(s){
   const n = s.path.length;
+  const R = s.r;
+  const bb = s.bbox, mg = R + 14;
+  if(sx(bb.x1) < -mg || sx(bb.x0) > W + mg || sy(bb.y1) < -mg || sy(bb.y0) > H + mg) return;
   for(let i = n - 1; i >= 0; i--){
     const nd = s.path[i];
     const px = Math.round(sx(nd.x)), py = Math.round(sy(nd.y));
-    if(px < -8 || px > W + 8 || py < -8 || py > H + 8) continue;
-    let r = CFG.R_BODY;
-    if(i > n - 5) r = 2;
+    if(px < -12 || px > W + 12 || py < -12 || py > H + 12) continue;
+    let r = R;
+    const t = n - 1 - i;           // distância até a ponta do rabo
+    if(t < 8) r = Math.max(2, Math.round(R * (0.55 + 0.45 * t / 8)));
     ctx.drawImage(discSprite(s.color, r), px - r, py - r);
   }
   const hx = Math.round(sx(s.x)), hy = Math.round(sy(s.y));
-  const hr = s.boosting ? 4 : CFG.R_HEAD;
+  const hr = s.boosting ? R + 1 : R;
   ctx.drawImage(discSprite(s.color, hr), hx - hr, hy - hr);
 
-  // olhos
+  // olhos (crescem com a cobra)
   const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
   const ex = -sa, ey = ca;
+  const ox = ca * R * 0.4, oy = sa * R * 0.4;
+  const sep = Math.max(2, R * 0.65);
+  const es = R >= 6 ? 3 : (R >= 4 ? 2 : 1);
+  const e1x = hx + ox + ex * sep, e1y = hy + oy + ey * sep;
+  const e2x = hx + ox - ex * sep, e2y = hy + oy - ey * sep;
   ctx.fillStyle = PAL.LIGHT;
-  const ox = ca * 1.2, oy = sa * 1.2;
-  ctx.fillRect(Math.round(hx + ox + ex * 2), Math.round(hy + oy + ey * 2), 1, 1);
-  ctx.fillRect(Math.round(hx + ox - ex * 2), Math.round(hy + oy - ey * 2), 1, 1);
+  if(es === 1){
+    ctx.fillRect(Math.round(e1x), Math.round(e1y), 1, 1);
+    ctx.fillRect(Math.round(e2x), Math.round(e2y), 1, 1);
+  } else {
+    const h = (es - 1) / 2;
+    ctx.fillRect(Math.round(e1x - h), Math.round(e1y - h), es, es);
+    ctx.fillRect(Math.round(e2x - h), Math.round(e2y - h), es, es);
+    ctx.fillStyle = PAL.DARK;     // pupila olhando para frente
+    ctx.fillRect(Math.round(e1x + ca * 0.8), Math.round(e1y + sa * 0.8), 1, 1);
+    ctx.fillRect(Math.round(e2x + ca * 0.8), Math.round(e2y + sa * 0.8), 1, 1);
+  }
 
   // nome
+  const ny = hy - 12 - (R - 3);
   if(s.name && !s.isPlayer && hx > -30 && hx < W + 30 && hy > -20 && hy < H + 20){
-    drawTextC(s.name, hx, hy - 12, PAL.DARK, 1);
+    drawTextC(s.name, hx, ny, PAL.DARK, 1);
   }
   if(s.isPlayer && mode === 'play'){
-    drawTextC('VOCE', hx, hy - 12, PAL.DARK, 1);
+    drawTextC(s.name, hx, ny, PAL.DARK, 1);
   }
 }
 
@@ -904,7 +1180,7 @@ function drawHUD(){
   let y = 3;
   for(let i = 0; i < alive.length && i < limit; i++){
     const s = alive[i];
-    const label = (i + 1) + ' ' + (s.isPlayer ? 'VOCE' : (showNames ? s.name : '')) + ' ' + Math.round(s.mass);
+    const label = (i + 1) + ' ' + (s.isPlayer ? s.name : (showNames ? s.name : '')) + ' ' + Math.round(s.mass);
     const w = textWidth(label, 1);
     drawText(label, W - 4 - w, y, s.isPlayer ? PAL.DARK : PAL.MID, 1);
     y += 9;
@@ -966,55 +1242,304 @@ function panel(x, y, w, h, fill){
   ctx.fillRect(x, y, 1, h); ctx.fillRect(x + w - 1, y, 1, h);
 }
 
-function drawMenu(){
+/* cobra pixelada animada (fundo do menu) */
+const COBRA_W = 64, COBRA_H = 60;
+const cobraCv = document.createElement('canvas');
+cobraCv.width = COBRA_W; cobraCv.height = COBRA_H;
+const cg = cobraCv.getContext('2d');
+const CB = { OUT:'#3a4a0f', BODY:'#6f9120', HI:'#8fb02a', BELLY:'#dff0a0', EYE:'#1f2b06' };
+
+function cEll(cx, cy, rx, ry, col){
+  cx = Math.round(cx); cy = Math.round(cy); rx = Math.round(rx); ry = Math.max(1, Math.round(ry));
+  cg.fillStyle = col;
+  for(let dy = -ry; dy <= ry; dy++){
+    const half = Math.floor(rx * Math.sqrt(Math.max(0, 1 - (dy * dy) / (ry * ry + 0.0001))) + 0.0001);
+    cg.fillRect(cx - half, cy + dy, half * 2 + 1, 1);
+  }
+}
+function cDisc(cx, cy, r, col){ cEll(cx, cy, r, r, col); }
+
+function drawCobraSprite(t){
+  cg.clearRect(0, 0, COBRA_W, COBRA_H);
+  const wag = Math.sin(t * 3.2), wag2 = Math.sin(t * 3.2 - 0.9);
+
+  // cauda em gancho (balança)
+  const P0 = {x:18, y:47}, P1 = {x:1 + wag2 * 1.5, y:42}, P2 = {x:2 + wag2 * 3, y:21 + wag * 1.5}, P3 = {x:14 + wag * 4, y:25 + Math.cos(t * 3.2) * 2.5};
+  const tail = [];
+  for(let i = 0; i <= 36; i++){
+    const u = i / 36, v = 1 - u;
+    const a = v * v * v, b = 3 * v * v * u, c = 3 * v * u * u, d = u * u * u;
+    tail.push({ x: a * P0.x + b * P1.x + c * P2.x + d * P3.x,
+                y: a * P0.y + b * P1.y + c * P2.y + d * P3.y,
+                r: Math.max(1, 4 - 3 * u) });
+  }
+  for(let i = 0; i < tail.length; i++) cDisc(tail[i].x, tail[i].y, Math.round(tail[i].r) + 1, CB.OUT);
+  for(let i = 0; i < tail.length; i++) cDisc(tail[i].x, tail[i].y, Math.round(tail[i].r), CB.BODY);
+
+  // espiral da base
+  cEll(34, 49, 28, 10, CB.OUT);
+  cEll(34, 49, 27, 9, CB.BELLY);
+  cEll(34, 47, 27, 8, CB.BODY);
+  cg.fillStyle = CB.HI;
+  for(let y = 39; y <= 55; y++){
+    for(let x = 7; x <= 61; x++){
+      const dx = (x - 34) / 26, dy = (y - 47) / 7.5;
+      if(dx * dx + dy * dy < 0.85 && ((x * 3 + y * 5) % 7 === 0)) cg.fillRect(x, y, 1, 1);
+    }
+  }
+
+  // pescoço (balança de leve)
+  const sw = Math.sin(t * 2) * 1.6;
+  const neck = [];
+  for(let i = 0; i <= 18; i++){
+    const u = i / 18;
+    neck.push({ x: 39 - 11 * u + sw * u * u - 3 * Math.sin(u * Math.PI), y: 44 - 30 * u, r: 8 - 2 * u });
+  }
+  for(let i = 0; i < neck.length; i++) cDisc(neck[i].x, neck[i].y, Math.round(neck[i].r) + 1, CB.OUT);
+  for(let i = 0; i < neck.length; i++) cDisc(neck[i].x, neck[i].y, Math.round(neck[i].r), CB.BODY);
+  for(let i = 3; i < neck.length; i++) cDisc(neck[i].x - 2, neck[i].y, Math.max(2, Math.round(neck[i].r) - 3), CB.BELLY);
+
+  // capelo + cabeça
+  const hx = Math.round(28 + sw), hy = Math.round(14 + Math.sin(t * 2.5) * 0.8);
+  cEll(hx + 4, hy + 3, 11, 10, CB.OUT);
+  cEll(hx + 4, hy + 3, 10, 9, CB.BODY);
+  cEll(hx + 5, hy + 4, 5, 6, CB.HI);
+
+  cEll(hx - 5, hy + 4, 7, 2, CB.OUT);
+  cEll(hx - 5, hy + 4, 6, 1, CB.BELLY);
+  cEll(hx - 2, hy, 9, 5, CB.OUT);
+  cEll(hx - 2, hy, 8, 4, CB.BODY);
+  cEll(hx - 9, hy + 1, 5, 4, CB.OUT);
+  cEll(hx - 9, hy + 1, 4, 3, CB.BODY);
+  cg.fillStyle = CB.OUT;
+  cg.fillRect(hx - 12, hy + 3, 9, 1);           // boca
+
+  // olho (pisca de vez em quando)
+  if((t % 3.6) > 3.45){
+    cg.fillStyle = CB.OUT; cg.fillRect(hx - 4, hy - 1, 2, 1);
+  } else {
+    cg.fillStyle = CB.EYE; cg.fillRect(hx - 4, hy - 2, 2, 2);
+    cg.fillStyle = CB.BELLY; cg.fillRect(hx - 4, hy - 2, 1, 1);
+  }
+
+  // língua
+  const ph = t % 2.8;
+  if(ph < 0.5){
+    const len = Math.round(Math.min(1, ph * 8) * 6);
+    cg.fillStyle = CB.EYE;
+    cg.fillRect(hx - 14 - len, hy + 3, len, 1);
+    if(len >= 4){ cg.fillRect(hx - 14 - len, hy + 2, 1, 1); cg.fillRect(hx - 14 - len, hy + 4, 1, 1); }
+  }
+
+  // espiral da frente
+  cEll(37, 52, 25, 7, CB.OUT);
+  cEll(37, 52, 24, 6, CB.BODY);
+  cEll(37, 50, 22, 4, CB.HI);
+}
+
+
+/* layout do menu (usado para desenhar e para detectar cliques) */
+function diffLabels(btnW){
+  return btnW >= textWidth('DIFICIL', 1) + 4 ? ['FACIL', 'MEDIO', 'DIFICIL'] : ['F', 'M', 'D'];
+}
+
+function menuLayout(){
   const pw = Math.max(112, Math.min(W - 12, 200));
-  const lines = ['MOUSE = GUIAR', 'TOQUE = GUIAR', 'CLIQUE = TURBO', 'ESPACO = TURBO',
-                 'COMER = CRESCER', 'MELHOR ' + pad4(best)];
-  const ph = 46 + lines.length * 10 + 22;
-  const px = Math.round((W - pw) / 2), py = Math.round((H - ph) / 2);
-  panel(px, py, pw, ph, 'rgba(165,201,58,0.93)');
+  let lines = [];
+  if(H >= 215){
+    lines = ['MOUSE = GUIAR', 'TOQUE = GUIAR', 'CLIQUE = TURBO', 'ESPACO = TURBO',
+             'COMER = CRESCER', 'MELHOR ' + pad4(best)];
+  } else if(H >= 185){
+    lines = ['MOUSE = GUIAR', 'CLIQUE = TURBO', 'COMER = CRESCER', 'MELHOR ' + pad4(best)];
+  }
+  const compact = H < 140;
+  const ts = H >= 140 ? Math.max(1, Math.min(3, Math.floor((pw - 14) / textWidth('SNAKE.IO', 1)))) : 1;
+  const bw = pw - 24;
+  const L = { pw: pw, lines: lines, ts: ts, bw: bw, compact: compact };
+  let y = 8;
+  L.titleY = y; y += 7 * ts + 4;
+  L.decoY = y;  if(!compact) y += 7;
+  L.linesY = y; y += lines.length * 10 + (lines.length ? 2 : 0);
+  L.labelY = y; if(!compact) y += 9;
+  L.fieldY = y; y += 13 + 5;
+  L.dLabelY = y; if(!compact) y += 9;
+  L.dRowY = y;  y += 13 + 5;
+  L.playY = y;  y += 13 + 4;
+  L.closeY = y; y += 13 + 7;
+  L.ph = y;
+  L.px = Math.round((W - pw) / 2);
+  L.py = Math.round((H - L.ph) / 2);
+  L.bx = L.px + Math.round((pw - bw) / 2);
+  L.dRowX = L.px + 4;
+  L.dBtnW = Math.floor((pw - 8 - 4) / 3);
+  return L;
+}
 
-  const ts = Math.max(1, Math.min(3, Math.floor((pw - 14) / textWidth('SNAKE.IO', 1))));
-  drawTextC('SNAKE.IO', W / 2, py + 8, PAL.DARK, ts);
+function drawMenu(){
+  const L = menuLayout();
+  panel(L.px, L.py, L.pw, L.ph, 'rgba(165,201,58,0.93)');
 
-  // cobrinha decorativa
-  const dy = py + 10 + 7 * ts + 4;
-  ctx.fillStyle = PAL.MID;
-  for(let i = 0; i < 14; i++) ctx.fillRect(px + 12 + i * 3, dy, 2, 2);
-  ctx.fillStyle = PAL.DARK;
-  ctx.fillRect(px + 12 + 13 * 3 + 1, dy - 1, 2, 2);
+  // cobra animada no fundo (atrás de textos e botões)
+  drawCobraSprite(tclock);
+  const csc = (L.ph >= 130 && L.pw >= 140) ? 2 : 1;
+  const cw = COBRA_W * csc, ch = COBRA_H * csc;
+  ctx.globalAlpha = 0.6;
+  ctx.drawImage(cobraCv, L.px + Math.round((L.pw - cw) / 2), L.py + Math.round((L.ph - ch) / 2), cw, ch);
+  ctx.globalAlpha = 1;
 
-  let y = dy + 7;
-  for(let i = 0; i < lines.length; i++){
-    drawTextC(lines[i], W / 2, y, i === lines.length - 1 ? PAL.MID : PAL.DARK, 1);
+  drawTextC('SNAKE.IO', W / 2, L.py + L.titleY, PAL.DARK, L.ts);
+
+  if(!L.compact){
+    const dy = L.py + L.decoY;
+    ctx.fillStyle = PAL.MID;
+    for(let i = 0; i < 14; i++) ctx.fillRect(L.px + 12 + i * 3, dy, 2, 2);
+    ctx.fillStyle = PAL.DARK;
+    ctx.fillRect(L.px + 12 + 13 * 3 + 1, dy - 1, 2, 2);
+  }
+
+  let y = L.py + L.linesY;
+  for(let i = 0; i < L.lines.length; i++){
+    drawTextC(L.lines[i], W / 2, y, i === L.lines.length - 1 ? PAL.MID : PAL.DARK, 1);
     y += 10;
   }
-  if((tclock % 1) < 0.62) drawTextC('JOGAR', W / 2, py + ph - 11, PAL.DARK, 1);
+
+  // campo de nome
+  if(!L.compact) drawTextC('NOME', W / 2, L.py + L.labelY, PAL.MID, 1);
+  const fy = L.py + L.fieldY;
+  const focused = document.activeElement === nameEl;
+  panel(L.bx, fy, L.bw, 13, 'rgba(223,240,160,0.75)');
+  if(focused){
+    ctx.fillStyle = PAL.MID;
+    ctx.fillRect(L.bx + 2, fy + 2, L.bw - 4, 1);
+    ctx.fillRect(L.bx + 2, fy + 10, L.bw - 4, 1);
+  }
+  if(playerName){
+    drawText(playerName, L.bx + 4, fy + 3, PAL.DARK, 1);
+  } else if(!focused){
+    drawText('VOCE', L.bx + 4, fy + 3, PAL.MID, 1);
+  }
+  if(focused && (tclock % 1) < 0.6){
+    ctx.fillStyle = PAL.DARK;
+    ctx.fillRect(L.bx + 4 + textWidth(playerName, 1), fy + 3, 1, 7);
+  }
+
+  // dificuldade da IA
+  if(!L.compact) drawTextC('DIFICULDADE', W / 2, L.py + L.dLabelY, PAL.MID, 1);
+  const labels = diffLabels(L.dBtnW);
+  for(let i = 0; i < 3; i++){
+    const bx = L.dRowX + i * (L.dBtnW + 2), by = L.py + L.dRowY;
+    const sel = (i === difficulty);
+    panel(bx, by, L.dBtnW, 13, sel ? PAL.DARK : 'rgba(223,240,160,0.6)');
+    drawTextC(labels[i], bx + L.dBtnW / 2, by + 3, sel ? PAL.LIGHT : PAL.DARK, 1);
+  }
+
+  // botão JOGAR
+  const py2 = L.py + L.playY;
+  panel(L.bx, py2, L.bw, 13, PAL.DARK);
+  drawTextC('JOGAR', W / 2, py2 + 3, PAL.LIGHT, 1);
+
+  // botão FECHAR
+  const cy2 = L.py + L.closeY;
+  panel(L.bx, cy2, L.bw, 13, 'rgba(223,240,160,0.6)');
+  drawTextC('FECHAR', W / 2, cy2 + 3, PAL.DARK, 1);
+}
+
+/* ---------- tela de morte: fundo vermelho + caveira de cobra ---------- */
+const SKULL_UP = ["..................................................", "..................................................", ".............................WWWWWWWWWWWW.........", "......................WWWWWWWWgWWWWWWWWWWWW.......", "...................WWWWWWWWWWWgWWWWWWWWWWWWW......", "................WWWWgggWWWWWWWWgWWWWWWWWWWWWW.....", "............WWWWWgggWggggggWWWWggWWWWWWWWWWWWW....", ".........WWWWWgggWWWggkkkkggWWWWgWWWWWWWWWWWWWW...", "......WWWWWWWWWWWWWggkkkkkkggWWWgWWWWWWWWWWWWWW...", "...WWWWWWWWWWWWWWWWgkkkkkkkkgWWWWgWWWWWWWWWWWWW...", "..WWWWWWWWWWWWWWWWWgkkkkkkkkgWWWWgWWWWWWWWWWWWWW..", ".WWWkkkWWWWWWWWWWWWgkkkkkkkkgWWWWgWWWWWWWWWWWWWW..", ".WWWkkkWWWWWWWWWWWWgkkkkkkkkgWWWWgWWWWWWWWWWWWWW..", ".WWWkkkWWWWWWWWWWWWggkkkkkkggWWWgWWWWWWWWWWWWWWW..", "..WWWWWWWWWWWWWWWWWWggkkkkggWWWWgWWWWWWWWWWWWWW...", "..WWWWWWWWWWWWWWWWWWWggggggWWWWWgWWWWWWWWWWWWWW...", "..WWWWWWWWWWWWWWWWWWWWWWWWWWWWWgWWWWWWWWWWWWWWW...", "...WWWWWWWWWWWWWWWWWWWWWWWWWWWWgWWWWWWWWWWWWWW....", "...WWWWWWWWWWWWWWWWWWWWWWWWWWWWgWWWWWWWWWWWWW.....", "...W.WWWWW..WWWW..WWWWWWWWWWWWWWWWWWWWWWWWWW......", ".....WWWW...WWW...........WWWWWWWWWWWWWWWWWW......", "......WW.....W..........................WWWW......", "......WW.....W..........................WWWW......", "......WW.....W..........................WWWW......", "......WW.....W..........................WWWW......", "......WW.....W..........................WWWW......", ".............W..........................WWWW......", "........................................WWWW......", "........................................WWWW......"];
+const SKULL_LO = ["................WW.WW.WW.WW.WW.WW.WW..............", ".............................WWWWWWWWW............", "...........WWWWWWWWWWWWWWWWWWWWWWWWWWWW...........", "..WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW..........", "..WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW..........", "...WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW............", ".....WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW............."];
+const SKULL_LOY = 24, SKULL_W = 50, SKULL_H = 35;
+const SKULL_COL = { W:'#ffffff', g:'#cdcdcd', k:'#4a0804' };
+
+function drawPix(rows, x, y, sc){
+  for(let r = 0; r < rows.length; r++){
+    const row = rows[r];
+    let c = 0;
+    while(c < row.length){
+      const ch = row[c];
+      if(ch === '.'){ c++; continue; }
+      let e = c;
+      while(e < row.length && row[e] === ch) e++;
+      ctx.fillStyle = SKULL_COL[ch];
+      ctx.fillRect(x + c * sc, y + r * sc, (e - c) * sc, sc);
+      c = e;
+    }
+  }
+}
+
+function deadLayout(){
+  const sc = H >= 150 ? 2 : 1;
+  const ts = textWidth('VOCE MORREU', 2) <= W - 10 ? 2 : 1;
+  const bw = Math.min(W - 16, 118), bh = 13;
+  const skH = SKULL_H * sc;
+  const total = skH + 6 + 7 * ts + 5 + 7 + 7 + bh + 4 + bh;
+  const top = Math.max(2, Math.round((H - total) / 2));
+  const L = { sc: sc, ts: ts, bw: bw, bh: bh };
+  L.skX = Math.round((W - SKULL_W * sc) / 2);
+  L.skY = top;
+  L.titleY = top + skH + 6;
+  L.statY = L.titleY + 7 * ts + 5;
+  L.bx = Math.round((W - bw) / 2);
+  L.retryY = L.statY + 14;
+  L.menuY = L.retryY + bh + 4;
+  return L;
 }
 
 function drawDead(){
-  if(!player) return;
-  const alive = snakes.filter(function(s){ return !s.dead; });
-  alive.sort(function(a, b){ return b.mass - a.mass; });
+  const t = deadT;
+  const a = Math.min(0.8, t * 2.2);
+  ctx.fillStyle = 'rgba(165,20,8,' + a + ')';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(40,0,0,' + (a * 0.55) + ')';
+  ctx.fillRect(0, 0, W, 3); ctx.fillRect(0, H - 3, W, 3);
+  ctx.fillRect(0, 0, 3, H); ctx.fillRect(W - 3, 0, 3, H);
 
-  const pw = Math.max(120, Math.min(W - 12, 190));
-  const ph = 92;
-  const px = Math.round((W - pw) / 2), py = Math.round((H - ph) / 2);
-  panel(px, py, pw, ph, 'rgba(165,201,58,0.94)');
+  const L = deadLayout();
 
-  const ts = Math.max(1, Math.min(2, Math.floor((pw - 14) / textWidth('MORREU', 1))));
-  drawTextC('VOCE', W / 2, py + 8, PAL.DARK, ts);
-  drawTextC('MORREU', W / 2, py + 10 + 7 * ts, PAL.DARK, ts);
+  // caveira entra caindo e depois "ri" mexendo a mandíbula
+  const u = Math.max(0, Math.min(1, (t - 0.25) / 0.5));
+  if(u > 0){
+    const e = 1 - Math.pow(1 - u, 3);
+    const jaw = u < 1 ? 0 : (Math.sin(t * 7) > 0.15 ? 4 : 1);
+    const yo = Math.round(-(1 - e) * 16);
+    ctx.globalAlpha = e;
+    drawPix(SKULL_LO, L.skX, L.skY + yo + (SKULL_LOY + jaw) * L.sc, L.sc);
+    drawPix(SKULL_UP, L.skX, L.skY + yo, L.sc);
+    ctx.globalAlpha = 1;
+  }
 
-  let y = py + 14 + 14 * ts;
-  drawTextC('TAMANHO ' + pad4(player.mass), W / 2, y, PAL.MID, 1); y += 10;
-  drawTextC('MELHOR  ' + pad4(best), W / 2, y, PAL.MID, 1); y += 10;
-  drawTextC('RIVAIS  ' + alive.length, W / 2, y, PAL.MID, 1); y += 12;
+  if(t > 0.55){
+    ctx.globalAlpha = Math.min(1, (t - 0.55) / 0.25);
+    drawTextC('VOCE MORREU', W / 2 + L.ts, L.titleY + L.ts, '#4a0804', L.ts);
+    drawTextC('VOCE MORREU', W / 2, L.titleY, '#ffffff', L.ts);
+    let stat = 'TAM ' + pad4(player ? player.mass : 0) + ' MELHOR ' + pad4(best);
+    if(textWidth(stat, 1) > W - 6) stat = 'TAM ' + pad4(player ? player.mass : 0);
+    drawTextC(stat, W / 2, L.statY, '#ffd9d2', 1);
+    ctx.globalAlpha = 1;
+  }
 
-  if((tclock % 1) < 0.62) drawTextC('JOGAR DE NOVO', W / 2, py + ph - 11, PAL.DARK, 1);
+  if(t > 0.8){
+    ctx.globalAlpha = Math.min(1, (t - 0.8) / 0.25);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(L.bx, L.retryY, L.bw, L.bh);
+    drawTextC('TENTAR DE NOVO', W / 2, L.retryY + 3, '#8a1208', 1);
+
+    ctx.fillStyle = 'rgba(60,4,2,0.6)';
+    ctx.fillRect(L.bx, L.menuY, L.bw, L.bh);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(L.bx, L.menuY, L.bw, 1); ctx.fillRect(L.bx, L.menuY + L.bh - 1, L.bw, 1);
+    ctx.fillRect(L.bx, L.menuY, 1, L.bh); ctx.fillRect(L.bx + L.bw - 1, L.menuY, 1, L.bh);
+    drawTextC('VOLTAR AO MENU', W / 2, L.menuY + 3, '#ffffff', 1);
+    ctx.globalAlpha = 1;
+  }
 }
 
 function render(){
+  const shake = (mode === 'dead' && deadT < 0.45);
+  if(shake){
+    const m = 4 * (1 - deadT / 0.45);
+    ctx.save();
+    ctx.translate(Math.round((Math.random() - 0.5) * 2 * m), Math.round((Math.random() - 0.5) * 2 * m));
+  }
   drawArena();
   drawFood();
 
@@ -1027,7 +1552,8 @@ function render(){
 
   if(mode === 'play') drawHUD();
   if(mode === 'menu') drawMenu();
-  if(mode === 'dead'){ drawHUD(); drawDead(); }
+  if(shake) ctx.restore();
+  if(mode === 'dead') drawDead();
 
   if(flash > 0){
     ctx.fillStyle = 'rgba(223,240,160,' + Math.max(0, Math.min(0.85, flash * 2.4)) + ')';
