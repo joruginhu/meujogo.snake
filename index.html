@@ -119,7 +119,7 @@ function getName(){ return playerName.trim() || 'VOCE'; }
 
 function resize(){
   // não redimensiona enquanto o teclado está aberto no menu
-  if(document.activeElement === nameEl && mode === 'menu') return;
+  if(document.activeElement === nameEl && isFormMode()) return;
   const aw = Math.max(200, window.innerWidth - BEZEL);
   const ah = Math.max(160, window.innerHeight - BEZEL);
   let s = Math.round(Math.min(aw / 300, ah / 230));
@@ -278,6 +278,13 @@ let best = 0, tclock = 0, lastFrame = 0;
 const cam = {x:0, y:0};
 let nextAiName = 0;
 let difficulty = 1;      // 0 fácil | 1 médio | 2 difícil
+let online = false;      // true = jogando em uma sala multiplayer
+let lobbyPage = 0, joinTarget = null, formErr = '';
+const createOpts = { priv: false, max: 8 };
+// Endereço do servidor multiplayer (depois de publicar no Render). Ex.: 'wss://snake-io-abcd.onrender.com'
+const SERVER_URL = '';
+const BASE_R = 900;
+const ONLINE_SHADES = ['#42561a','#4d5a12','#3b5220','#556019','#48602a','#2f4a2a','#5b6b1c','#3d4d17'];
 
 /* ============================================================
    SNAKE
@@ -313,13 +320,21 @@ function makeSnake(o){
     state: 'wander', prey: null, threat: null,
     err: 0, phase: Math.random() * 6.28,
     stratT: Math.random() * 0.8, steerT: Math.random() * 0.1,
-    desAngle: o.angle, blind: 0, boostT: 0, boostCool: 0
+    desAngle: o.angle, blind: 0, boostT: 0, boostCool: 0,
+    skipUntil: 0, skipX: 0, skipY: 0, nearTarget: null, nearSince: 0
   };
   const n = nodesFor(o.mass);
   for(let i = 0; i < n; i++){
     s.path.push({ x: o.x - Math.cos(o.angle) * i * CFG.SEG,
                   y: o.y - Math.sin(o.angle) * i * CFG.SEG });
   }
+  let bx0 = s.x, by0 = s.y, bx1 = s.x, by1 = s.y;
+  for(let i = 0; i < s.path.length; i++){
+    const q = s.path[i];
+    if(q.x < bx0) bx0 = q.x; if(q.x > bx1) bx1 = q.x;
+    if(q.y < by0) by0 = q.y; if(q.y > by1) by1 = q.y;
+  }
+  s.bbox.x0 = bx0; s.bbox.y0 = by0; s.bbox.x1 = bx1; s.bbox.y1 = by1;
   return s;
 }
 
@@ -329,52 +344,19 @@ function randPoint(maxD){
   return { x: Math.cos(a) * d, y: Math.sin(a) * d };
 }
 
-/* tamanhos variados: pequenas, médias, grandes e gigantes */
-function randAiMass(initial){
-  const r = Math.random();
-  if(initial){
-    if(r < 0.45) return 10 + Math.random() * 25;
-    if(r < 0.78) return 35 + Math.random() * 65;
-    if(r < 0.94) return 100 + Math.random() * 120;
-    return 220 + Math.random() * 180;
-  }
-  if(r < 0.6) return 10 + Math.random() * 20;
-  if(r < 0.9) return 30 + Math.random() * 50;
-  return 80 + Math.random() * 100;
-}
-
-/* sorteia um ponto longe de qualquer cobra viva */
-function safePoint(maxD, clear){
-  const c2 = clear * clear;
-  let p = randPoint(maxD);
-  for(let t = 0; t < 40; t++){
-    p = randPoint(maxD);
-    let ok = true;
-    for(let k = 0; k < snakes.length && ok; k++){
-      const o = snakes[k];
-      if(o.dead) continue;
-      for(let i = 0; i < o.path.length; i += 3){
-        const dx = o.path[i].x - p.x, dy = o.path[i].y - p.y;
-        if(dx * dx + dy * dy < c2){ ok = false; break; }
-      }
-    }
-    if(ok) return p;
-  }
-  return p;
-}
-
 function spawnAI(initial){
-  const mass = randAiMass(initial);
-  const maxD = CFG.R * (mass > 150 ? 0.6 : 0.82);
-  const p = initial ? randPoint(maxD) : safePoint(maxD, 40);
-  // cabeça aponta para fora, então o corpo fica para o lado do centro
-  const angle = Math.atan2(p.y, p.x) + (Math.random() - 0.5) * 1.2;
+  let mass = randAiMass(initial), sp;
+  for(let k = 0; k < 4; k++){
+    sp = findSpawn(WORLD, mass, { maxD: CFG.R * (mass > 150 ? 0.6 : 0.82), clear: 12, ahead: 50, outward: true });
+    if(sp.gap >= 0 || mass < 14) break;
+    mass = Math.max(10, mass * 0.7);       // sem espaço livre: nasce menor
+  }
   const name = AI_NAMES[(nextAiName++) % AI_NAMES.length];
   const s = makeSnake({
     name: name,
     color: AI_SHADES[Math.floor(Math.random() * AI_SHADES.length)],
-    x: p.x, y: p.y,
-    angle: angle,
+    x: sp.x, y: sp.y,
+    angle: sp.angle,
     mass: mass,
     isPlayer: false
   });
@@ -384,12 +366,12 @@ function spawnAI(initial){
 }
 
 function spawnPlayer(){
-  const p = safePoint(CFG.R * 0.6, 80);
+  const sp = findSpawn(WORLD, CFG.START_MASS, { maxD: CFG.R * 0.6, clear: 60, ahead: 170, outward: false });
   player = makeSnake({
     name: getName(),
     color: PLAYER_COLOR,
-    x: p.x, y: p.y,
-    angle: Math.random() * Math.PI * 2,
+    x: sp.x, y: sp.y,
+    angle: sp.angle,
     mass: CFG.START_MASS,
     isPlayer: true
   });
@@ -433,18 +415,36 @@ function inTurbo(x, y){
   return x >= b.x - 6 && x <= b.x + b.s + 6 && y >= b.y - 6 && y <= b.y + b.s + 6;
 }
 
-/* ---------- campo de nome (input oculto + desenho no canvas) ---------- */
-nameEl.addEventListener('input', function(){
-  let v = nameEl.value.toUpperCase().replace(/[^A-Z0-9 .\-]/g, '').replace(/^\s+/, '');
-  v = v.slice(0, 10);
-  if(v !== nameEl.value) nameEl.value = v;
-  playerName = v;
-});
-nameEl.addEventListener('blur', function(){ resize(); });
+/* ---------- campos de texto (input oculto + desenho no canvas) ---------- */
+const FIELDS = {
+  name:  { max: 10, re: /[^A-Z0-9 .\-]/g },
+  room:  { max: 12, re: /[^A-Z0-9 .\-]/g },
+  pass:  { max: 12, re: /[^A-Z0-9]/g },
+  jpass: { max: 12, re: /[^A-Z0-9]/g }
+};
+const fval = { room: '', pass: '', jpass: '' };
+let activeField = null;
 
-function focusName(){
+function fieldVal(k){ return k === 'name' ? playerName : fval[k]; }
+function setFieldVal(k, v){ if(k === 'name') playerName = v; else fval[k] = v; }
+
+nameEl.addEventListener('input', function(){
+  const k = activeField || 'name';
+  const sp = FIELDS[k];
+  let v = nameEl.value.toUpperCase().replace(sp.re, '').replace(/^\s+/, '').slice(0, sp.max);
+  if(v !== nameEl.value) nameEl.value = v;
+  setFieldVal(k, v);
+});
+nameEl.addEventListener('blur', function(){ activeField = null; resize(); });
+
+function focusField(k){
+  activeField = k;
+  nameEl.maxLength = FIELDS[k].max;
+  nameEl.value = fieldVal(k);
   try{ nameEl.focus({preventScroll:true}); }catch(e){ nameEl.focus(); }
 }
+function fieldFocused(k){ return activeField === k && document.activeElement === nameEl; }
+function isFormMode(){ return mode === 'menu' || mode === 'lobby' || mode === 'create' || mode === 'joinpass'; }
 
 function closeGame(){
   try{ window.close(); }catch(e){}
@@ -461,7 +461,7 @@ function hitRect(p, x, y, w, h){
 cv.addEventListener('pointerdown', function(e){
   initAudio();
   if(e.pointerType === 'touch') touchMode = true;
-  if(mode === 'menu' || mode === 'dead') return;   // menu e tela de morte usam 'click'
+  if(mode !== 'play') return;   // menus e telas usam o evento 'click'
   const p = canvasPos(e);
   if(touchMode && inTurbo(p.x, p.y)){
     turboHeld = true; boostId = e.pointerId;
@@ -479,28 +479,21 @@ cv.addEventListener('click', function(e){
   if(mode === 'dead'){
     if(deadT < 0.8) return;
     const D = deadLayout();
-    if(hitRect(p, D.bx, D.retryY, D.bw, D.bh)) startGame();
+    if(hitRect(p, D.bx, D.retryY, D.bw, D.bh)) retryGame();
     else if(hitRect(p, D.bx, D.menuY, D.bw, D.bh)) goMenu();
-    return;
-  }
-  if(mode !== 'menu') return;
-  const L = menuLayout();
-  for(let i = 0; i < 3; i++){
-    if(hitRect(p, L.dRowX + i * (L.dBtnW + 2), L.py + L.dRowY, L.dBtnW, 13)){
-      setDifficulty(i);
-      return;
-    }
-  }
-  if(hitRect(p, L.bx, L.py + L.fieldY, L.bw, 13)){
-    focusName();
-  } else if(hitRect(p, L.bx, L.py + L.playY, L.bw, 13)){
-    startGame();
-  } else if(hitRect(p, L.bx, L.py + L.closeY, L.bw, 13)){
-    closeGame();
-  } else {
-    nameEl.blur();
-  }
+  } else if(mode === 'menu') menuClick(p);
+  else if(mode === 'lobby') lobbyClick(p);
+  else if(mode === 'create') createClick(p);
+  else if(mode === 'joinpass') joinClick(p);
 });
+
+cv.addEventListener('wheel', function(e){
+  if(mode === 'lobby'){
+    lobbyPage += (e.deltaY > 0 ? 1 : -1);
+    clampLobbyPage();
+    e.preventDefault();
+  }
+}, {passive:false});
 
 cv.addEventListener('pointermove', function(e){
   if(steerId !== null && e.pointerId !== steerId) return;
@@ -518,12 +511,10 @@ cv.addEventListener('pointercancel', releasePointer);
 window.addEventListener('blur', function(){ pointer.down = false; turboHeld = false; });
 
 window.addEventListener('keydown', function(e){
-  // digitando o nome
+  // digitando em um campo
   if(e.target === nameEl){
-    if(e.key === 'Enter'){
-      nameEl.blur();
-      if(mode === 'menu') startGame();
-    }
+    if(e.key === 'Enter'){ nameEl.blur(); formEnter(); }
+    else if(e.key === 'Escape'){ nameEl.blur(); formEscape(); }
     return;
   }
   const k = e.key.toLowerCase();
@@ -531,24 +522,40 @@ window.addEventListener('keydown', function(e){
   initAudio();
   if(k === ' ' || k === 'arrowup' || k === 'arrowdown' || k === 'arrowleft' || k === 'arrowright') e.preventDefault();
   if(k === 'm') muted = !muted;
-  if(mode === 'menu'){
-    if(k === 'enter') startGame();
-  } else if(mode === 'dead'){
-    if(k === 'enter' && deadT > 0.8) startGame();
+  if(mode === 'dead'){
+    if(k === 'enter' && deadT > 0.8) retryGame();
     else if(k === 'escape') goMenu();
-  }
+  } else if(mode === 'play'){
+    if(k === 'escape' && online){ leaveOnline(); openLobby(); }
+  } else if(k === 'enter') formEnter();
+  else if(k === 'escape') formEscape();
 });
 
 window.addEventListener('keyup', function(e){ keys[e.key.toLowerCase()] = false; });
 document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
 document.addEventListener('touchmove', function(e){ e.preventDefault(); }, {passive:false});
 
+function formEnter(){
+  if(mode === 'menu') startGame();
+  else if(mode === 'create') submitCreate();
+  else if(mode === 'joinpass') submitJoin();
+}
+function formEscape(){
+  if(mode === 'lobby') mode = 'menu';
+  else if(mode === 'create' || mode === 'joinpass'){ mode = 'lobby'; formErr = ''; }
+}
+
 function goMenu(){
   nameEl.blur();
+  leaveOnline();
   turboHeld = false; pointer.down = false; pointer.active = false;
   resetWorld(false);
   mode = 'menu';
   flash = 0; killMsg = 0;
+}
+
+function retryGame(){
+  if(online) onlineRespawn(); else startGame();
 }
 
 /* ============================================================
@@ -634,6 +641,10 @@ function steerPlayer(dt){
 /* ============================================================
    IA
    ============================================================ */
+/* AI-CORE-BEGIN  (mesmo código no jogo e no servidor — não editar só de um lado) */
+const AI_SEG = 2;
+const FOOD_CELL = 60;
+
 /* parâmetros de cada dificuldade */
 const DIFF = [
   { // FÁCIL: reage devagar, erra a mira, quase não ataca
@@ -647,19 +658,166 @@ const DIFF = [
     noise:0.05, err:0.04, look:1.3,  aggr:0.80, hunt:1.00, boost:1.0, flee:1.0,  turn:1.0,  mistake:0 }
 ];
 
-function setDifficulty(i){
-  difficulty = i;
-  for(let k = 0; k < snakes.length; k++){
-    if(!snakes[k].isPlayer) snakes[k].turnMul = DIFF[i].turn;
+/* tamanhos variados: pequenas, médias, grandes e gigantes */
+function randAiMass(initial){
+  const r = Math.random();
+  if(initial){
+    if(r < 0.45) return 10 + Math.random() * 25;
+    if(r < 0.78) return 35 + Math.random() * 65;
+    if(r < 0.94) return 100 + Math.random() * 120;
+    return 220 + Math.random() * 180;
   }
-  beep(500 + i * 140, 0.05, 0.02);
+  if(r < 0.6) return 10 + Math.random() * 20;
+  if(r < 0.9) return 30 + Math.random() * 50;
+  return 80 + Math.random() * 100;
 }
 
-/* distância (0..1) de perigo em um ponto: corpos, cabeças e a previsão da cabeça */
-function obstaclePenalty(px, py, self){
+/* campos de IA que toda cobra controlada pela IA precisa ter */
+function aiFields(angle){
+  return {
+    turnMul: 1, state: 'wander', prey: null, threat: null,
+    err: 0, phase: Math.random() * 6.28,
+    stratT: Math.random() * 0.8, steerT: Math.random() * 0.1,
+    desAngle: angle, blind: 0, boostT: 0, boostCool: 0,
+    skipUntil: 0, skipX: 0, skipY: 0, nearTarget: null, nearSince: 0
+  };
+}
+
+/* ---------- onde nascer sem cruzar ninguém ---------- */
+/* testa o corpo inteiro (para trás) e o caminho à frente contra todas as cobras vivas */
+function findSpawn(w, mass, opt){
+  const n = nodesFor(mass), rn = radiusFor(mass);
+  const list = [];
+  for(let i = 0; i < w.snakes.length; i++) if(!w.snakes[i].dead) list.push(w.snakes[i]);
+  const nb = Math.ceil(n / 3);
+  const total = nb + Math.ceil(opt.ahead / 10);
+  const lim = (w.R - 45) * (w.R - 45);
+  let best = null, bestGap = -1e9;
+  for(let t = 0; t < 90; t++){
+    const a0 = Math.random() * Math.PI * 2, dd = Math.sqrt(Math.random()) * opt.maxD;
+    const x = Math.cos(a0) * dd, y = Math.sin(a0) * dd;
+    const angle = opt.outward ? Math.atan2(y, x) + (Math.random() - 0.5) * 1.2 : Math.random() * Math.PI * 2;
+    const ca = Math.cos(angle), sa = Math.sin(angle);
+    let minGap = 1e9, wall = false;
+    for(let i = 0; i < total && !wall; i++){
+      const dist = i < nb ? -i * 3 * AI_SEG : (i - nb + 1) * 10;
+      const px = x + ca * dist, py = y + sa * dist;
+      if(px * px + py * py > lim){ wall = true; break; }
+      for(let k = 0; k < list.length; k++){
+        const o = list[k], b = o.bbox;
+        const m = rn + o.r + opt.clear + 6;
+        if(px < b.x0 - m || px > b.x1 + m || py < b.y0 - m || py > b.y1 + m) continue;
+        let md2 = (o.x - px) * (o.x - px) + (o.y - py) * (o.y - py);
+        for(let q = 0; q < o.path.length; q += 2){
+          const dx = o.path[q].x - px, dy = o.path[q].y - py;
+          const d2 = dx * dx + dy * dy;
+          if(d2 < md2) md2 = d2;
+        }
+        const gap = Math.sqrt(md2) - rn - o.r;
+        if(gap < minGap) minGap = gap;
+      }
+    }
+    if(wall) continue;
+    if(minGap >= opt.clear) return { x: x, y: y, angle: angle, gap: minGap };
+    if(minGap > bestGap){ bestGap = minGap; best = { x: x, y: y, angle: angle, gap: minGap }; }
+  }
+  return best || { x: 0, y: 0, angle: Math.random() * Math.PI * 2, gap: -1 };
+}
+
+/* ---------- mapa de comida (grade) para as IAs "enxergarem" onde tem bolinha ---------- */
+function foodKey(cx, cy){ return (cx + 64) * 128 + (cy + 64); }
+
+function rebuildFoodGrid(w, list){
+  const g = w.grid;
+  g.clear();
+  for(const f of list){
+    if(f.gone) continue;
+    const cx = Math.floor(f.x / FOOD_CELL), cy = Math.floor(f.y / FOOD_CELL);
+    const k = foodKey(cx, cy);
+    let c = g.get(k);
+    if(!c){ c = { list: [], sum: 0, sx: 0, sy: 0 }; g.set(k, c); }
+    c.list.push(f);
+    c.sum += f.m * (f.big ? 1.6 : 1);
+    c.sx += f.x; c.sy += f.y;
+  }
+}
+
+function foodRichness(w, x, y, rad){
+  const x0 = Math.floor((x - rad) / FOOD_CELL), x1 = Math.floor((x + rad) / FOOD_CELL);
+  const y0 = Math.floor((y - rad) / FOOD_CELL), y1 = Math.floor((y + rad) / FOOD_CELL);
+  let sum = 0;
+  for(let cx = x0; cx <= x1; cx++){
+    for(let cy = y0; cy <= y1; cy++){
+      const c = w.grid.get(foodKey(cx, cy));
+      if(c) sum += c.sum;
+    }
+  }
+  return sum;
+}
+
+/* bolinha mais "gostosa" por perto (perto, grande e à frente) */
+function bestFoodAround(w, s, rad){
+  const rad2 = rad * rad;
+  const x0 = Math.floor((s.x - rad) / FOOD_CELL), x1 = Math.floor((s.x + rad) / FOOD_CELL);
+  const y0 = Math.floor((s.y - rad) / FOOD_CELL), y1 = Math.floor((s.y + rad) / FOOD_CELL);
+  const skip = w.time < s.skipUntil;
+  let best = null, bs = 0;
+  for(let cx = x0; cx <= x1; cx++){
+    for(let cy = y0; cy <= y1; cy++){
+      const c = w.grid.get(foodKey(cx, cy));
+      if(!c) continue;
+      for(let i = 0; i < c.list.length; i++){
+        const f = c.list[i];
+        if(f.gone) continue;
+        const dx = f.x - s.x, dy = f.y - s.y, d2 = dx * dx + dy * dy;
+        if(d2 > rad2) continue;
+        if(skip && Math.abs(f.x - s.skipX) < 14 && Math.abs(f.y - s.skipY) < 14) continue;
+        const dist = Math.sqrt(d2);
+        const ang = Math.abs(angleDiff(Math.atan2(dy, dx), s.angle));
+        if(dist < 22 && ang > 1.3) continue;           // colada e atrás: pega na volta
+        const sc = f.m * (f.big ? 1.8 : 1) / (dist + 10) * (1.35 - ang * 0.3);
+        if(sc > bs){ bs = sc; best = f; }
+      }
+    }
+  }
+  return best;
+}
+
+/* melhor "monte" de comida mais longe (restos de cobra morta, aglomerados) */
+function bestCluster(w, s, d, scary){
+  const rad = (320 + s.r * 10) * d.look;
+  const cr = Math.ceil(rad / FOOD_CELL);
+  const ccx = Math.floor(s.x / FOOD_CELL), ccy = Math.floor(s.y / FOOD_CELL);
+  let best = null, bs = 0;
+  for(let cx = ccx - cr; cx <= ccx + cr; cx++){
+    for(let cy = ccy - cr; cy <= ccy + cr; cy++){
+      const c = w.grid.get(foodKey(cx, cy));
+      if(!c || c.sum <= 0) continue;
+      const n = c.list.length;
+      const mx = c.sx / n, my = c.sy / n;
+      const dx = mx - s.x, dy = my - s.y;
+      const dist = Math.hypot(dx, dy);
+      if(dist > rad) continue;
+      const ang = Math.abs(angleDiff(Math.atan2(dy, dx), s.angle));
+      const sc = c.sum / (dist + 45) * (1.3 - ang * 0.22);
+      if(sc <= bs) continue;
+      let bad = false;
+      for(let j = 0; j < scary.length; j++){
+        if(Math.hypot(mx - scary[j].x, my - scary[j].y) < 60 + scary[j].r * 3){ bad = true; break; }
+      }
+      if(bad) continue;
+      bs = sc; best = { x: mx, y: my };
+    }
+  }
+  return best;
+}
+
+/* ---------- percepção de perigo ---------- */
+function obstaclePenalty(w, px, py, self){
   let minD = 1e9;
-  for(let k = 0; k < snakes.length; k++){
-    const o = snakes[k];
+  const list = w.snakes;
+  for(let k = 0; k < list.length; k++){
+    const o = list[k];
     if(o === self || o.dead) continue;
     const b = o.bbox;
     const m = 36 + o.r;
@@ -685,28 +843,29 @@ function obstaclePenalty(px, py, self){
   return Math.min(1.5, (18 - minD) / 18);
 }
 
-function wander(s){
+function wander(w, s){
   const a = Math.random() * Math.PI * 2;
   const dist = 90 + Math.random() * 220;
   let tx = s.x + Math.cos(a) * dist;
   let ty = s.y + Math.sin(a) * dist;
   const dd = Math.hypot(tx, ty);
-  const lim = CFG.R * 0.88;
+  const lim = w.R * 0.88;
   if(dd > lim){ tx *= lim / dd; ty *= lim / dd; }
   s.tx = tx; s.ty = ty;
 }
 
 /* decisão estratégica: fugir, caçar, comer ou passear */
-function aiStrategy(s){
-  const d = DIFF[difficulty];
+function aiStrategy(w, s){
+  const d = DIFF[w.diff];
   s.err = (Math.random() - 0.5) * 2 * d.err;
   s.prey = null; s.threat = null;
+  const list = w.snakes;
 
   const scary = [];
   let threat = null, td = 1e9;
   const tr = (140 + s.r * 6) * d.look;
-  for(let i = 0; i < snakes.length; i++){
-    const o = snakes[i];
+  for(let i = 0; i < list.length; i++){
+    const o = list[i];
     if(o === s || o.dead || o.mass <= s.mass * 1.2) continue;
     const dd = Math.hypot(o.x - s.x, o.y - s.y);
     if(dd < 420) scary.push(o);
@@ -716,46 +875,31 @@ function aiStrategy(s){
     s.state = 'flee'; s.threat = threat; return;
   }
 
-  if(Math.random() < d.aggr){
+  // com fome (muita comida por perto) a IA caça bem menos
+  let aggr = d.aggr;
+  if(foodRichness(w, s.x, s.y, 120) > 5) aggr *= 0.25;
+  if(Math.random() < aggr){
     let bestS = 0, prey = null;
     const lim = (260 + s.r * 8) * d.look;
-    for(let i = 0; i < snakes.length; i++){
-      const o = snakes[i];
+    for(let i = 0; i < list.length; i++){
+      const o = list[i];
       if(o === s || o.dead || o.mass > s.mass * d.hunt) continue;
       const dd = Math.hypot(o.x - s.x, o.y - s.y);
       if(dd > lim) continue;
       let sc = (o.mass + 20) / (dd + 40);
-      if(o.isPlayer && difficulty > 0) sc *= 1.5;
+      if(o.isPlayer && w.diff > 0) sc *= 1.5;
       if(sc > bestS){ bestS = sc; prey = o; }
     }
     if(prey){ s.state = 'hunt'; s.prey = prey; return; }
   }
 
-  const maxD = (230 + s.r * 8) * d.look, maxD2 = maxD * maxD;
-  let bestF = 0, bi = -1;
-  for(let i = 0; i < food.length; i++){
-    const f = food[i];
-    const dx = f.x - s.x, dy = f.y - s.y;
-    const d2 = dx * dx + dy * dy;
-    if(d2 > maxD2) continue;
-    let sc = f.m * (f.big ? 1.8 : 1) / (Math.sqrt(d2) + 25);
-    const da = Math.abs(angleDiff(Math.atan2(dy, dx), s.angle));
-    sc *= 1.25 - da * 0.22;
-    if(scary.length){
-      let bad = false;
-      for(let j = 0; j < scary.length; j++){
-        if(Math.hypot(f.x - scary[j].x, f.y - scary[j].y) < 55 + scary[j].r * 3){ bad = true; break; }
-      }
-      if(bad) continue;
-    }
-    if(sc > bestF){ bestF = sc; bi = i; }
-  }
-  if(bi >= 0){ s.state = 'food'; s.tx = food[bi].x; s.ty = food[bi].y; return; }
-  s.state = 'wander'; wander(s);
+  const cl = bestCluster(w, s, d, scary);
+  if(cl){ s.state = 'food'; s.tx = cl.x; s.ty = cl.y; return; }
+  s.state = 'wander'; wander(w, s);
 }
 
 /* ângulo desejado conforme o estado (com ruído "humano") */
-function aiGoalAngle(s, d){
+function aiGoalAngle(w, s, d){
   let tx = s.tx, ty = s.ty;
   const st = s.state;
   if(st === 'flee'){
@@ -768,8 +912,8 @@ function aiGoalAngle(s, d){
         let ax = s.x - th.x, ay = s.y - th.y;
         const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
         const cl = Math.hypot(s.x, s.y) || 1;
-        const w = Math.max(0, cl / CFG.R - 0.4) * 1.4;   // perto da borda, mistura com o centro
-        ax += (-s.x / cl) * w; ay += (-s.y / cl) * w;
+        const wgt = Math.max(0, cl / w.R - 0.4) * 1.4;     // perto da borda, mistura com o centro
+        ax += (-s.x / cl) * wgt; ay += (-s.y / cl) * wgt;
         tx = s.x + ax * 100; ty = s.y + ay * 100;
         if(dist < 100 + th.r * 3 && s.mass > 24 && s.boostCool <= 0 && Math.random() < d.boost){
           s.boostT = 0.5 + Math.random() * 0.6; s.boostCool = 2.2;
@@ -793,21 +937,33 @@ function aiGoalAngle(s, d){
         }
       }
     }
-  } else if(st === 'food'){
-    if(Math.hypot(tx - s.x, ty - s.y) < 10) s.stratT = 0;      // chegou: escolhe a próxima
   } else {
-    if(Math.hypot(tx - s.x, ty - s.y) < 30) wander(s);
+    // comendo / passeando: vai sempre atrás da bolinha mais próxima à frente (varre o monte inteiro)
+    const nf = bestFoodAround(w, s, st === 'food' ? 95 : 70);
+    if(nf){
+      s.state = 'food'; s.tx = nf.x; s.ty = nf.y; tx = nf.x; ty = nf.y;
+      const dd = Math.hypot(nf.x - s.x, nf.y - s.y);
+      if(dd < 28){
+        // colada mas sem conseguir pegar (órbita): ignora essa bolinha por um tempo
+        if(s.nearTarget !== nf){ s.nearTarget = nf; s.nearSince = w.time; }
+        else if(w.time - s.nearSince > 1.1){ s.skipX = nf.x; s.skipY = nf.y; s.skipUntil = w.time + 4; s.nearTarget = null; }
+      } else s.nearTarget = null;
+    } else if(st === 'food'){
+      if(Math.hypot(tx - s.x, ty - s.y) < 14) s.stratT = 0;      // chegou: escolhe o próximo monte
+    } else {
+      if(Math.hypot(tx - s.x, ty - s.y) < 30) wander(w, s);
+    }
   }
   const sway = (st === 'hunt' || st === 'flee') ? 0.35 : 1;
-  return Math.atan2(ty - s.y, tx - s.x) + s.err + Math.sin(tclock * 1.7 + s.phase) * d.noise * sway;
+  return Math.atan2(ty - s.y, tx - s.x) + s.err + Math.sin(w.time * 1.7 + s.phase) * d.noise * sway;
 }
 
 /* escolhe a melhor direção livre perto do ângulo desejado (antenas à frente) */
-function aiSteer(s, desired, d){
+function aiSteer(w, s, desired, d){
   const R = s.r;
   const look1 = (16 + R * 2) * d.look;
   const look2 = look1 * 2.1;
-  const wl = CFG.R - 28 - R;
+  const wl = w.R - 28 - R;
   const blind = s.blind > 0;
   let bestScore = -1e9, bestA = s.angle;
   for(let k = -7; k <= 7; k++){
@@ -821,16 +977,16 @@ function aiSteer(s, desired, d){
     if(b1 > wl) score -= 6 + (b1 - wl) * 0.5;
     if(b2 > wl) score -= 2 + (b2 - wl) * 0.15;
     if(!blind){
-      score -= obstaclePenalty(x1, y1, s) * 10;
-      score -= obstaclePenalty(x2, y2, s) * 4;
+      score -= obstaclePenalty(w, x1, y1, s) * 10;
+      score -= obstaclePenalty(w, x2, y2, s) * 4;
     }
     if(score > bestScore){ bestScore = score; bestA = a; }
   }
   return bestA;
 }
 
-function aiThink(s, dt){
-  const d = DIFF[difficulty];
+function aiThink(w, s, dt){
+  const d = DIFF[w.diff];
   s.stratT -= dt; s.steerT -= dt;
   if(s.blind > 0) s.blind -= dt;
   if(s.boostCool > 0) s.boostCool -= dt;
@@ -838,16 +994,34 @@ function aiThink(s, dt){
 
   if(s.stratT <= 0){
     s.stratT = d.stratMin + Math.random() * (d.stratMax - d.stratMin);
-    aiStrategy(s);
+    aiStrategy(w, s);
   }
   if(s.steerT <= 0){
     s.steerT = d.reactMin + Math.random() * (d.reactMax - d.reactMin);
     if(d.mistake && Math.random() < d.mistake) s.blind = 0.5 + Math.random() * 0.6;
-    s.desAngle = aiSteer(s, aiGoalAngle(s, d), d);
+    s.desAngle = aiSteer(w, s, aiGoalAngle(w, s, d), d);
   }
   // suaviza a mudança de direção (movimento fluido)
   s.targetAngle += angleDiff(s.desAngle, s.targetAngle) * Math.min(1, dt * 9);
-  s.boosting = s.boostT > 0 && s.mass > 20;
+  s.wantBoost = s.boosting = s.boostT > 0 && s.mass > 20;
+}
+/* AI-CORE-END */
+
+/* "mundo" que a IA enxerga no modo offline */
+const WORLD = {
+  get snakes(){ return snakes; },
+  get R(){ return CFG.R; },
+  get time(){ return tclock; },
+  get diff(){ return difficulty; },
+  grid: new Map(), gridT: 0
+};
+
+function setDifficulty(i){
+  difficulty = i;
+  for(let k = 0; k < snakes.length; k++){
+    if(!snakes[k].isPlayer) snakes[k].turnMul = DIFF[i].turn;
+  }
+  beep(500 + i * 140, 0.05, 0.02);
 }
 
 /* ============================================================
@@ -930,6 +1104,7 @@ function updateFood(dt){
       const dx = f.x - s.x, dy = f.y - s.y;
       if(dx * dx + dy * dy < rr2){
         s.mass += f.m;
+        f.gone = true;
         food.splice(j, 1);
         if(s.isPlayer){
           beep(f.big ? 420 : (620 + Math.random() * 180), 0.035, 0.018);
@@ -967,13 +1142,22 @@ function update(dt){
   tclock += dt;
   if(flash > 0) flash -= dt;
   if(killMsg > 0) killMsg -= dt;
+  if(online){
+    netUpdate(dt);
+    if(mode === 'dead') deadT += dt;
+    return;
+  }
+  if((mode === 'lobby' || mode === 'create' || mode === 'joinpass') && net.state === 'failed' && tclock >= net.retryAt) netConnect();
+
+  WORLD.gridT -= dt;
+  if(WORLD.gridT <= 0){ WORLD.gridT = 0.15; rebuildFoodGrid(WORLD, food); }
 
   for(let i = respawnQ.length - 1; i >= 0; i--){
     respawnQ[i] -= dt;
     if(respawnQ[i] <= 0){ respawnQ.splice(i, 1); spawnAI(false); }
   }
 
-  if(mode === 'menu'){
+  if(isFormMode()){
     cam.x = Math.cos(tclock * 0.07) * CFG.R * 0.5;
     cam.y = Math.sin(tclock * 0.11) * CFG.R * 0.5;
   }
@@ -983,7 +1167,7 @@ function update(dt){
   for(let i = 0; i < snakes.length; i++){
     const s = snakes[i];
     if(s.dead) continue;
-    if(!s.isPlayer) aiThink(s, dt);
+    if(!s.isPlayer) aiThink(WORLD, s, dt);
     moveSnake(s, dt);
   }
 
@@ -1346,26 +1530,28 @@ function diffLabels(btnW){
 function menuLayout(){
   const pw = Math.max(112, Math.min(W - 12, 200));
   let lines = [];
-  if(H >= 215){
+  if(H >= 225){
     lines = ['MOUSE = GUIAR', 'TOQUE = GUIAR', 'CLIQUE = TURBO', 'ESPACO = TURBO',
              'COMER = CRESCER', 'MELHOR ' + pad4(best)];
-  } else if(H >= 185){
+  } else if(H >= 200){
     lines = ['MOUSE = GUIAR', 'CLIQUE = TURBO', 'COMER = CRESCER', 'MELHOR ' + pad4(best)];
   }
-  const compact = H < 140;
-  const ts = H >= 140 ? Math.max(1, Math.min(3, Math.floor((pw - 14) / textWidth('SNAKE.IO', 1)))) : 1;
+  const compact = H < 156;
+  const ts = !compact ? Math.max(1, Math.min(3, Math.floor((pw - 14) / textWidth('SNAKE.IO', 1)))) : 1;
   const bw = pw - 24;
   const L = { pw: pw, lines: lines, ts: ts, bw: bw, compact: compact };
-  let y = 8;
+  const g1 = compact ? 3 : 5, g2 = compact ? 3 : 4;
+  let y = compact ? 5 : 8;
   L.titleY = y; y += 7 * ts + 4;
   L.decoY = y;  if(!compact) y += 7;
   L.linesY = y; y += lines.length * 10 + (lines.length ? 2 : 0);
   L.labelY = y; if(!compact) y += 9;
-  L.fieldY = y; y += 13 + 5;
+  L.fieldY = y; y += 13 + g1;
   L.dLabelY = y; if(!compact) y += 9;
-  L.dRowY = y;  y += 13 + 5;
-  L.playY = y;  y += 13 + 4;
-  L.closeY = y; y += 13 + 7;
+  L.dRowY = y;  y += 13 + g1;
+  L.playY = y;  y += 13 + g2;
+  L.multiY = y; y += 13 + g2;
+  L.closeY = y; y += 13 + (compact ? 4 : 7);
   L.ph = y;
   L.px = Math.round((W - pw) / 2);
   L.py = Math.round((H - L.ph) / 2);
@@ -1373,6 +1559,71 @@ function menuLayout(){
   L.dRowX = L.px + 4;
   L.dBtnW = Math.floor((pw - 8 - 4) / 3);
   return L;
+}
+
+/* campo de texto desenhado no canvas */
+function drawField(x, y, w, key, placeholder, mask){
+  const focused = fieldFocused(key);
+  panel(x, y, w, 13, 'rgba(223,240,160,0.75)');
+  if(focused){
+    ctx.fillStyle = PAL.MID;
+    ctx.fillRect(x + 2, y + 2, w - 4, 1);
+    ctx.fillRect(x + 2, y + 10, w - 4, 1);
+  }
+  const raw = fieldVal(key);
+  const txt = mask ? new Array(raw.length + 1).join('*') : raw;
+  if(txt) drawText(txt, x + 4, y + 3, PAL.DARK, 1);
+  else if(!focused && placeholder) drawText(placeholder, x + 4, y + 3, PAL.MID, 1);
+  if(focused && (tclock % 1) < 0.6){
+    ctx.fillStyle = PAL.DARK;
+    ctx.fillRect(x + 4 + textWidth(txt, 1), y + 3, 1, 7);
+  }
+}
+
+function drawBtn(x, y, w, label, solid, h){
+  h = h || 13;
+  panel(x, y, w, h, solid ? PAL.DARK : 'rgba(223,240,160,0.6)');
+  drawTextC(label, x + w / 2, y + Math.round((h - 7) / 2), solid ? PAL.LIGHT : PAL.DARK, 1);
+}
+
+/* cadeados em pixel (7x8) */
+const LOCK_CLOSED = ['..###..', '.#...#.', '.#...#.', '#######', '#######', '###.###', '###.###', '#######'];
+const LOCK_OPEN   = ['..###..', '.#...#.', '.#.....', '#######', '#######', '###.###', '###.###', '#######'];
+function drawBits(rows, x, y, color){
+  ctx.fillStyle = color;
+  for(let r = 0; r < rows.length; r++){
+    const row = rows[r];
+    let c = 0;
+    while(c < row.length){
+      if(row[c] !== '#'){ c++; continue; }
+      let e = c;
+      while(e < row.length && row[e] === '#') e++;
+      ctx.fillRect(x + c, y + r, e - c, 1);
+      c = e;
+    }
+  }
+}
+function drawLock(x, y, closed, color){ drawBits(closed ? LOCK_CLOSED : LOCK_OPEN, x, y, color); }
+
+function menuClick(p){
+  const L = menuLayout();
+  for(let i = 0; i < 3; i++){
+    if(hitRect(p, L.dRowX + i * (L.dBtnW + 2), L.py + L.dRowY, L.dBtnW, 13)){
+      setDifficulty(i);
+      return;
+    }
+  }
+  if(hitRect(p, L.bx, L.py + L.fieldY, L.bw, 13)){
+    focusField('name');
+  } else if(hitRect(p, L.bx, L.py + L.playY, L.bw, 13)){
+    startGame();
+  } else if(hitRect(p, L.bx, L.py + L.multiY, L.bw, 13)){
+    openLobby();
+  } else if(hitRect(p, L.bx, L.py + L.closeY, L.bw, 13)){
+    closeGame();
+  } else {
+    nameEl.blur();
+  }
 }
 
 function drawMenu(){
@@ -1403,45 +1654,18 @@ function drawMenu(){
     y += 10;
   }
 
-  // campo de nome
   if(!L.compact) drawTextC('NOME', W / 2, L.py + L.labelY, PAL.MID, 1);
-  const fy = L.py + L.fieldY;
-  const focused = document.activeElement === nameEl;
-  panel(L.bx, fy, L.bw, 13, 'rgba(223,240,160,0.75)');
-  if(focused){
-    ctx.fillStyle = PAL.MID;
-    ctx.fillRect(L.bx + 2, fy + 2, L.bw - 4, 1);
-    ctx.fillRect(L.bx + 2, fy + 10, L.bw - 4, 1);
-  }
-  if(playerName){
-    drawText(playerName, L.bx + 4, fy + 3, PAL.DARK, 1);
-  } else if(!focused){
-    drawText('VOCE', L.bx + 4, fy + 3, PAL.MID, 1);
-  }
-  if(focused && (tclock % 1) < 0.6){
-    ctx.fillStyle = PAL.DARK;
-    ctx.fillRect(L.bx + 4 + textWidth(playerName, 1), fy + 3, 1, 7);
-  }
+  drawField(L.bx, L.py + L.fieldY, L.bw, 'name', 'VOCE', false);
 
-  // dificuldade da IA
   if(!L.compact) drawTextC('DIFICULDADE', W / 2, L.py + L.dLabelY, PAL.MID, 1);
   const labels = diffLabels(L.dBtnW);
   for(let i = 0; i < 3; i++){
-    const bx = L.dRowX + i * (L.dBtnW + 2), by = L.py + L.dRowY;
-    const sel = (i === difficulty);
-    panel(bx, by, L.dBtnW, 13, sel ? PAL.DARK : 'rgba(223,240,160,0.6)');
-    drawTextC(labels[i], bx + L.dBtnW / 2, by + 3, sel ? PAL.LIGHT : PAL.DARK, 1);
+    drawBtn(L.dRowX + i * (L.dBtnW + 2), L.py + L.dRowY, L.dBtnW, labels[i], i === difficulty);
   }
 
-  // botão JOGAR
-  const py2 = L.py + L.playY;
-  panel(L.bx, py2, L.bw, 13, PAL.DARK);
-  drawTextC('JOGAR', W / 2, py2 + 3, PAL.LIGHT, 1);
-
-  // botão FECHAR
-  const cy2 = L.py + L.closeY;
-  panel(L.bx, cy2, L.bw, 13, 'rgba(223,240,160,0.6)');
-  drawTextC('FECHAR', W / 2, cy2 + 3, PAL.DARK, 1);
+  drawBtn(L.bx, L.py + L.playY, L.bw, 'JOGAR (IA)', true);
+  drawBtn(L.bx, L.py + L.multiY, L.bw, 'MULTIPLAYER', false);
+  drawBtn(L.bx, L.py + L.closeY, L.bw, 'FECHAR', false);
 }
 
 /* ---------- tela de morte: fundo vermelho + caveira de cobra ---------- */
@@ -1533,6 +1757,473 @@ function drawDead(){
   }
 }
 
+/* ============================================================
+   MULTIPLAYER (cliente)
+   ============================================================ */
+const net = {
+  ws: null, state: 'off',          // off | connecting | open | failed | nourl
+  retryAt: 0, connectT: 0,
+  rooms: [],
+  id: null, roomName: '',
+  snakes: new Map(), foodMap: new Map(), players: {},
+  seq: 0, lastAngle: null, lastBoost: false, lastSend: 0, camSnap: true
+};
+
+function serverUrl(){
+  try{
+    const q = new URLSearchParams(window.location.search).get('server');
+    if(q) return q;
+  }catch(e){}
+  const h = window.location && window.location.hostname;
+  if(h === 'localhost' || h === '127.0.0.1') return 'ws://' + h + ':8080';
+  return SERVER_URL;
+}
+
+function netSend(obj){
+  if(net.ws && net.ws.readyState === 1){
+    try{ net.ws.send(JSON.stringify(obj)); }catch(e){}
+  }
+}
+
+function netConnect(){
+  if(net.ws && (net.ws.readyState === 0 || net.ws.readyState === 1)) return;
+  const url = serverUrl();
+  if(!url){ net.state = 'nourl'; return; }
+  net.state = 'connecting';
+  net.connectT = tclock;
+  // "acorda" o servidor grátis (pode levar ~30s) enquanto tenta conectar
+  try{ fetch(url.replace(/^ws/, 'http'), {mode: 'no-cors'}).catch(function(){}); }catch(e){}
+  let ws;
+  try{ ws = new WebSocket(url); }catch(e){ net.state = 'failed'; net.retryAt = tclock + 3; return; }
+  net.ws = ws;
+  ws.onopen = function(){
+    if(net.ws !== ws) return;
+    net.state = 'open';
+    netSend({t: 'list'});
+  };
+  ws.onmessage = function(ev){ if(net.ws === ws) netMessage(ev.data); };
+  ws.onclose = function(){
+    if(net.ws !== ws) return;
+    net.ws = null;
+    net.state = 'failed';
+    net.retryAt = tclock + 3;
+    if(online){
+      leaveOnline(true);
+      mode = 'lobby';
+      formErr = 'CONEXAO PERDIDA';
+    }
+  };
+  ws.onerror = function(){};
+}
+
+function netRefresh(){
+  if(net.state === 'open') netSend({t: 'list'});
+  else if(net.state === 'failed' || net.state === 'off') netConnect();
+}
+
+function netMessage(data){
+  let m;
+  try{ m = JSON.parse(data); }catch(e){ return; }
+  switch(m.t){
+    case 'rooms':
+      net.rooms = m.rooms || [];
+      clampLobbyPage();
+      break;
+    case 'joined': enterOnline(m); break;
+    case 'meta':
+      net.players = {};
+      for(let i = 0; i < m.players.length; i++) net.players[m.players[i].id] = m.players[i];
+      break;
+    case 's': if(online) applySnapshot(m); break;
+    case 'dead': if(online) onlineDead(m); break;
+    case 'kill':
+      killMsg = 1.6; killMsgText = 'ELIMINADO ' + m.name; sfxKill();
+      break;
+    case 'respawned':
+      if(online){ mode = 'play'; player = null; net.lastAngle = null; deadT = 0; flash = 0; sfxStart(); }
+      break;
+    case 'err':
+      formErr = m.msg || 'ERRO';
+      if(net.state === 'open') netSend({t: 'list'});
+      break;
+  }
+}
+
+function netMakeSnake(id, x, y, a, mass){
+  const s = {
+    id: id, isPlayer: id === net.id, name: '', color: '#42561a',
+    x: x, y: y, angle: a, sx: x, sy: y, sa: a,
+    mass: mass, r: radiusFor(mass), path: [], boosting: false, dead: false,
+    bbox: {x0: x, y0: y, x1: x, y1: y}, snapT: performance.now(), seen: 0
+  };
+  const n = nodesFor(mass);
+  for(let i = 0; i < n; i++){
+    s.path.push({ x: x - Math.cos(a) * i * CFG.SEG, y: y - Math.sin(a) * i * CFG.SEG });
+  }
+  return s;
+}
+
+function applySnapshot(m){
+  const now = performance.now();
+  net.seq++;
+  for(let i = 0; i < m.p.length; i++){
+    const e = m.p[i];
+    let s = net.snakes.get(e[0]);
+    if(!s){ s = netMakeSnake(e[0], e[1], e[2], e[3], e[4]); net.snakes.set(e[0], s); }
+    s.sx = e[1]; s.sy = e[2]; s.sa = e[3]; s.mass = e[4]; s.boosting = !!e[5];
+    s.snapT = now; s.seen = net.seq;
+  }
+  net.snakes.forEach(function(s, id){ if(s.seen !== net.seq) net.snakes.delete(id); });
+  if(m.fa) for(let i = 0; i < m.fa.length; i++){
+    const f = m.fa[i];
+    net.foodMap.set(f[0], { x: f[1], y: f[2], m: f[3], big: !!f[4] });
+  }
+  if(m.fr) for(let i = 0; i < m.fr.length; i++) net.foodMap.delete(m.fr[i]);
+}
+
+function enterOnline(m){
+  nameEl.blur();
+  online = true;
+  CFG.R = m.R;
+  net.id = m.you; net.roomName = m.name;
+  net.snakes = new Map(); net.foodMap = new Map(); net.players = {};
+  for(let i = 0; i < m.food.length; i++){
+    const f = m.food[i];
+    net.foodMap.set(f[0], { x: f[1], y: f[2], m: f[3], big: !!f[4] });
+  }
+  net.lastAngle = null; net.lastBoost = false; net.lastSend = 0; net.camSnap = true;
+  snakes = []; food = []; parts = []; floats = []; respawnQ = []; player = null;
+  mode = 'play'; deadT = 0; flash = 0; killMsg = 0; formErr = '';
+  sfxStart();
+}
+
+function leaveOnline(silent){
+  if(!online) return;
+  if(!silent) netSend({t: 'leave'});
+  online = false;
+  CFG.R = BASE_R;
+  net.snakes = new Map(); net.foodMap = new Map(); net.players = {}; net.id = null;
+  resetWorld(false);
+}
+
+function onlineDead(m){
+  mode = 'dead'; deadT = 0; flash = 0.35;
+  best = Math.max(best, Math.round(m.mass));
+  player = { mass: m.mass, dead: true, isPlayer: true, name: getName() };
+  net.snakes.delete(net.id);
+  sfxDeath();
+}
+
+function onlineRespawn(){ netSend({t: 'respawn'}); }
+
+function netUpdate(dt){
+  const now = performance.now();
+  const arr = [];
+  net.snakes.forEach(function(s){
+    const pl = net.players[s.id];
+    if(pl){
+      s.name = pl.name;
+      s.color = s.isPlayer ? PLAYER_COLOR : ONLINE_SHADES[pl.c % ONLINE_SHADES.length];
+    }
+    // posição prevista a partir do último pacote do servidor
+    const age = Math.min(0.12, (now - s.snapT) / 1000);
+    const spd = CFG.SPEED * (s.boosting ? CFG.BOOST_MULT : 1);
+    const tx = s.sx + Math.cos(s.sa) * spd * age, ty = s.sy + Math.sin(s.sa) * spd * age;
+    if(Math.hypot(tx - s.x, ty - s.y) > 80){
+      s.x = tx; s.y = ty;
+      s.path.length = 0;
+      const n = nodesFor(s.mass);
+      for(let i = 0; i < n; i++) s.path.push({ x: s.x - Math.cos(s.sa) * i * CFG.SEG, y: s.y - Math.sin(s.sa) * i * CFG.SEG });
+    } else {
+      const k = Math.min(1, dt * 14);
+      s.x += (tx - s.x) * k; s.y += (ty - s.y) * k;
+    }
+    s.angle += angleDiff(s.sa, s.angle) * Math.min(1, dt * 14);
+    s.r = radiusFor(s.mass);
+
+    // o corpo acompanha o caminho da cabeça
+    let last = s.path[0];
+    let dx = s.x - last.x, dy = s.y - last.y, d = Math.hypot(dx, dy), guard = 0;
+    while(d >= CFG.SEG && guard++ < 40){
+      const k2 = CFG.SEG / d;
+      s.path.unshift({ x: last.x + dx * k2, y: last.y + dy * k2 });
+      last = s.path[0]; dx = s.x - last.x; dy = s.y - last.y; d = Math.hypot(dx, dy);
+    }
+    const maxN = nodesFor(s.mass);
+    while(s.path.length > maxN) s.path.pop();
+
+    let x0 = s.x, y0 = s.y, x1 = s.x, y1 = s.y;
+    const st = s.path.length > 60 ? 2 : 1;
+    for(let i = 0; i < s.path.length; i += st){
+      const n = s.path[i];
+      if(n.x < x0) x0 = n.x; if(n.x > x1) x1 = n.x;
+      if(n.y < y0) y0 = n.y; if(n.y > y1) y1 = n.y;
+    }
+    s.bbox.x0 = x0; s.bbox.y0 = y0; s.bbox.x1 = x1; s.bbox.y1 = y1;
+    arr.push(s);
+  });
+  snakes = arr;
+  food = Array.from(net.foodMap.values());
+
+  if(mode === 'play'){
+    player = net.snakes.get(net.id) || null;
+    if(player){
+      netSteer(player, now);
+      if(net.camSnap){ cam.x = player.x; cam.y = player.y; net.camSnap = false; }
+      cam.x += (player.x - cam.x) * Math.min(1, dt * 11);
+      cam.y += (player.y - cam.y) * Math.min(1, dt * 11);
+    }
+  }
+}
+
+/* manda a direção/turbo para o servidor (no máximo ~20x por segundo) */
+function netSteer(p, now){
+  if(net.lastAngle === null) net.lastAngle = p.angle;
+  let ang = net.lastAngle;
+  if(keys['arrowleft'] || keys['a']) ang = p.angle - 1.0;
+  else if(keys['arrowright'] || keys['d']) ang = p.angle + 1.0;
+  else if(pointer.active){
+    const tx = pointer.x + cam.x - W / 2;
+    const ty = pointer.y + cam.y - H / 2;
+    const dx = tx - p.x, dy = ty - p.y;
+    if(dx * dx + dy * dy > 9) ang = Math.atan2(dy, dx);
+  }
+  const boost = !!((pointer.down || turboHeld || keys[' ']) && p.mass > 14);
+  const since = now - net.lastSend;
+  if((since > 50 && (Math.abs(angleDiff(ang, net.lastAngle)) > 0.03 || boost !== net.lastBoost)) || since > 300){
+    net.lastSend = now; net.lastAngle = ang; net.lastBoost = boost;
+    netSend({t: 'in', a: Math.round(ang * 100) / 100, b: boost ? 1 : 0});
+  }
+}
+
+/* ---------- lobby: lista de salas ---------- */
+function openLobby(){
+  nameEl.blur();
+  mode = 'lobby';
+  lobbyPage = 0; formErr = '';
+  netConnect();
+  netRefresh();
+}
+
+function lobbyLayout(){
+  const pw = Math.min(W - 8, 280), px = Math.round((W - pw) / 2);
+  const py = 4, ph = H - 8;
+  const L = { px: px, py: py, pw: pw, ph: ph };
+  L.titleY = py + 5;
+  L.statusY = py + 15;
+  L.headY = py + 26;
+  L.listY = py + 37;
+  L.rowH = 12;
+  L.btnY2 = py + ph - 6 - 13;
+  L.btnY1 = L.btnY2 - 3 - 13;
+  L.rows = Math.max(1, Math.floor((L.btnY1 - 3 - L.listY) / L.rowH));
+  L.bw = Math.floor((pw - 16 - 4) / 2);
+  L.bx1 = px + 8; L.bx2 = L.bx1 + L.bw + 4;
+  // linha de baixo:  [<] [VOLTAR] [>]
+  L.arrW = 20;
+  L.prevX = px + 8;
+  L.nextX = px + pw - 8 - L.arrW;
+  L.backX = L.prevX + L.arrW + 4;
+  L.backW = L.nextX - 4 - L.backX;
+  return L;
+}
+
+function lobbyPages(L){ return Math.max(1, Math.ceil(net.rooms.length / L.rows)); }
+function clampLobbyPage(){
+  const L = lobbyLayout();
+  lobbyPage = Math.max(0, Math.min(lobbyPage, lobbyPages(L) - 1));
+}
+
+function pickRoom(r){
+  if(net.state !== 'open'){ formErr = 'SEM CONEXAO'; return; }
+  if(r.n >= r.max){ formErr = 'SALA CHEIA'; return; }
+  formErr = '';
+  if(r.priv){
+    joinTarget = r; fval.jpass = '';
+    mode = 'joinpass';
+    focusField('jpass');
+  } else {
+    netSend({t: 'join', id: r.id, nick: getName()});
+  }
+}
+
+function lobbyClick(p){
+  const L = lobbyLayout();
+  const start = lobbyPage * L.rows;
+  for(let i = 0; i < L.rows; i++){
+    const r = net.rooms[start + i];
+    if(!r) break;
+    if(hitRect(p, L.px + 6, L.listY + i * L.rowH, L.pw - 12, L.rowH)){ pickRoom(r); return; }
+  }
+  if(hitRect(p, L.bx1, L.btnY1, L.bw, 13)){
+    if(net.state !== 'open'){ formErr = 'SEM CONEXAO'; return; }
+    mode = 'create'; formErr = '';
+    fval.room = ''; fval.pass = ''; createOpts.priv = false; createOpts.max = 8;
+  }
+  else if(hitRect(p, L.bx2, L.btnY1, L.bw, 13)){ formErr = ''; netRefresh(); }
+  else if(hitRect(p, L.prevX, L.btnY2, L.arrW, 13)){ lobbyPage--; clampLobbyPage(); }
+  else if(hitRect(p, L.nextX, L.btnY2, L.arrW, 13)){ lobbyPage++; clampLobbyPage(); }
+  else if(hitRect(p, L.backX, L.btnY2, L.backW, 13)){ mode = 'menu'; formErr = ''; }
+}
+
+function drawLobby(){
+  const L = lobbyLayout();
+  panel(L.px, L.py, L.pw, L.ph, 'rgba(165,201,58,0.95)');
+  drawTextC('SALAS ONLINE', W / 2, L.titleY, PAL.DARK, 1);
+
+  let st, dark = false;
+  if(net.state === 'nourl') st = 'SERVIDOR NAO CONFIGURADO';
+  else if(net.state === 'connecting') st = (tclock - net.connectT > 4) ? 'ACORDANDO SERVIDOR...' : 'CONECTANDO...';
+  else if(net.state === 'failed' || net.state === 'off') st = 'SEM CONEXAO - TENTANDO...';
+  else if(formErr){ st = formErr; dark = true; }
+  else st = net.rooms.length ? 'ESCOLHA UMA SALA' : 'NENHUMA SALA - CRIE UMA!';
+  if(formErr && net.state !== 'open'){ st = formErr; dark = true; }
+  drawTextC(st, W / 2, L.statusY, dark ? PAL.DARK : PAL.MID, 1);
+
+  drawText('SALA', L.px + 24, L.headY, PAL.MID, 1);
+  drawText('JOG', L.px + L.pw - 9 - textWidth('JOG', 1), L.headY, PAL.MID, 1);
+  ctx.fillStyle = PAL.MID;
+  ctx.fillRect(L.px + 6, L.headY + 9, L.pw - 12, 1);
+
+  const start = lobbyPage * L.rows;
+  for(let i = 0; i < L.rows; i++){
+    const r = net.rooms[start + i];
+    if(!r) break;
+    const y = L.listY + i * L.rowH;
+    const hov = pointer.active && !touchMode && hitRect(pointer, L.px + 6, y, L.pw - 12, L.rowH);
+    if(hov){ ctx.fillStyle = 'rgba(31,43,6,0.14)'; ctx.fillRect(L.px + 6, y, L.pw - 12, L.rowH); }
+    const full = r.n >= r.max;
+    const col = full ? PAL.MID : PAL.DARK;
+    drawLock(L.px + 10, y + 2, !!r.priv, col);
+    drawText(r.name, L.px + 24, y + 3, col, 1);
+    const cnt = r.n + '/' + r.max;
+    drawText(cnt, L.px + L.pw - 9 - textWidth(cnt, 1), y + 3, col, 1);
+    ctx.fillStyle = 'rgba(31,43,6,0.15)';
+    ctx.fillRect(L.px + 6, y + L.rowH - 1, L.pw - 12, 1);
+  }
+
+  drawBtn(L.bx1, L.btnY1, L.bw, 'CRIAR SALA', true);
+  drawBtn(L.bx2, L.btnY1, L.bw, 'ATUALIZAR', false);
+  drawBtn(L.prevX, L.btnY2, L.arrW, '<', false);
+  drawBtn(L.backX, L.btnY2, L.backW, 'VOLTAR', false);
+  drawBtn(L.nextX, L.btnY2, L.arrW, '>', false);
+  const pg = (lobbyPage + 1) + '/' + lobbyPages(L);
+  drawText(pg, L.px + L.pw - 9 - textWidth(pg, 1), L.titleY, PAL.MID, 1);
+}
+
+/* ---------- criar sala ---------- */
+function createLayout(){
+  const pw = Math.min(W - 8, 220);
+  const big = H >= 140;
+  const labels = H >= 175;
+  const g = big ? 4 : 3;
+  const L = { pw: pw, labels: labels };
+  L.px = Math.round((W - pw) / 2);
+  L.x = L.px + 8; L.w = pw - 16;
+  let y = big ? 7 : 4;
+  L.titleY = y; y += 7 + (big ? 6 : 3);
+  L.nameLabelY = y; if(labels) y += 9;
+  L.nameY = y; y += 13 + g;
+  L.maxY = y; y += 13 + g;
+  L.passLabelY = y; if(labels && createOpts.priv) y += 9;
+  L.passY = y; if(createOpts.priv) y += 13 + g;
+  L.errY = y; y += 9;
+  L.btnY = y; y += 13;
+  L.ph = y + (big ? 7 : 4);
+  L.py = Math.max(1, Math.round((H - L.ph) / 2));
+  L.privX = L.x + 66; L.privW = L.w - 66;
+  L.bw = Math.floor((L.w - 4) / 2);
+  L.bx1 = L.x; L.bx2 = L.x + L.bw + 4;
+  return L;
+}
+
+function createClick(p){
+  const L = createLayout();
+  if(hitRect(p, L.x, L.py + L.nameY, L.w, 13)) focusField('room');
+  else if(hitRect(p, L.privX, L.py + L.maxY, L.privW, 13)){ createOpts.priv = !createOpts.priv; nameEl.blur(); }
+  else if(createOpts.priv && hitRect(p, L.x, L.py + L.passY, L.w, 13)) focusField('pass');
+  else if(hitRect(p, L.bx1, L.py + L.btnY, L.bw, 13)) submitCreate();
+  else if(hitRect(p, L.bx2, L.py + L.btnY, L.bw, 13)){ nameEl.blur(); mode = 'lobby'; formErr = ''; }
+  else nameEl.blur();
+}
+
+function submitCreate(){
+  if(net.state !== 'open'){ formErr = 'SEM CONEXAO'; return; }
+  if(createOpts.priv && !fval.pass){ formErr = 'DEFINA UMA SENHA'; return; }
+  formErr = '';
+  netSend({ t: 'create', name: fval.room, priv: createOpts.priv ? 1 : 0,
+            pass: fval.pass, nick: getName() });
+}
+
+function drawCreate(){
+  const L = createLayout();
+  panel(L.px, L.py, L.pw, L.ph, 'rgba(165,201,58,0.95)');
+  drawTextC('CRIAR SALA', W / 2, L.py + L.titleY, PAL.DARK, 1);
+  if(L.labels) drawText('NOME DA SALA', L.x, L.py + L.nameLabelY, PAL.MID, 1);
+  drawField(L.x, L.py + L.nameY, L.w, 'room', 'MINHA SALA', false);
+
+  const my = L.py + L.maxY;
+  drawText('LIMITE 30', L.x, my + 3, PAL.MID, 1);
+  const pv = createOpts.priv;
+  panel(L.privX, my, L.privW, 13, pv ? PAL.DARK : 'rgba(223,240,160,0.6)');
+  const label = pv ? 'PRIVADA' : 'PUBLICA';
+  const tw = 7 + 4 + textWidth(label, 1);
+  const lx = L.privX + Math.round((L.privW - tw) / 2);
+  drawLock(lx, my + 3, pv, pv ? PAL.LIGHT : PAL.DARK);
+  drawText(label, lx + 11, my + 3, pv ? PAL.LIGHT : PAL.DARK, 1);
+
+  if(pv){
+    if(L.labels) drawText('SENHA (A-Z 0-9)', L.x, L.py + L.passLabelY, PAL.MID, 1);
+    drawField(L.x, L.py + L.passY, L.w, 'pass', 'SENHA', false);
+  }
+  if(formErr) drawTextC(formErr, W / 2, L.py + L.errY, PAL.DARK, 1);
+  drawBtn(L.bx1, L.py + L.btnY, L.bw, 'CRIAR', true);
+  drawBtn(L.bx2, L.py + L.btnY, L.bw, 'CANCELAR', false);
+}
+
+/* ---------- senha de sala privada ---------- */
+function joinLayout(){
+  const pw = Math.min(W - 8, 200), ph = 88;
+  const L = { pw: pw, ph: ph };
+  L.px = Math.round((W - pw) / 2);
+  L.py = Math.max(1, Math.round((H - ph) / 2));
+  L.fx = L.px + 10; L.fw = pw - 20;
+  L.bw = Math.floor((L.fw - 4) / 2);
+  L.bx1 = L.fx; L.bx2 = L.fx + L.bw + 4;
+  L.titleY = 8; L.nameY = 21; L.fieldY = 36; L.errY = 54; L.btnY = 66;
+  return L;
+}
+
+function joinClick(p){
+  const L = joinLayout();
+  if(hitRect(p, L.fx, L.py + L.fieldY, L.fw, 13)) focusField('jpass');
+  else if(hitRect(p, L.bx1, L.py + L.btnY, L.bw, 13)) submitJoin();
+  else if(hitRect(p, L.bx2, L.py + L.btnY, L.bw, 13)){ nameEl.blur(); mode = 'lobby'; formErr = ''; }
+  else nameEl.blur();
+}
+
+function submitJoin(){
+  if(!joinTarget) return;
+  if(!fval.jpass){ formErr = 'DIGITE A SENHA'; return; }
+  formErr = '';
+  netSend({ t: 'join', id: joinTarget.id, pass: fval.jpass, nick: getName() });
+}
+
+function drawJoin(){
+  const L = joinLayout();
+  panel(L.px, L.py, L.pw, L.ph, 'rgba(165,201,58,0.95)');
+  const title = 'SALA PRIVADA';
+  const tw = 7 + 4 + textWidth(title, 1);
+  const tx = Math.round(W / 2 - tw / 2);
+  drawLock(tx, L.py + L.titleY - 1, true, PAL.DARK);
+  drawText(title, tx + 11, L.py + L.titleY, PAL.DARK, 1);
+  if(joinTarget) drawTextC(joinTarget.name, W / 2, L.py + L.nameY, PAL.MID, 1);
+  drawField(L.fx, L.py + L.fieldY, L.fw, 'jpass', 'SENHA', true);
+  if(formErr) drawTextC(formErr, W / 2, L.py + L.errY, PAL.DARK, 1);
+  drawBtn(L.bx1, L.py + L.btnY, L.bw, 'ENTRAR', true);
+  drawBtn(L.bx2, L.py + L.btnY, L.bw, 'CANCELAR', false);
+}
+
 function render(){
   const shake = (mode === 'dead' && deadT < 0.45);
   if(shake){
@@ -1550,8 +2241,14 @@ function render(){
   if(player && !player.dead) drawSnake(player);
   drawParticles();
 
-  if(mode === 'play') drawHUD();
+  if(mode === 'play'){
+    drawHUD();
+    if(online && W >= 230) drawTextC(net.roomName, W / 2, 3, PAL.MID, 1);
+  }
   if(mode === 'menu') drawMenu();
+  else if(mode === 'lobby') drawLobby();
+  else if(mode === 'create') drawCreate();
+  else if(mode === 'joinpass') drawJoin();
   if(shake) ctx.restore();
   if(mode === 'dead') drawDead();
 
