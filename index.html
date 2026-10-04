@@ -4,6 +4,14 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"/>
 <title>SNAKE.IO — LCD EDITION</title>
+ <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+  const socket = io('https://SUA-URL-AQUI-8080.app.github.dev');
+
+  socket.on('connect', () => {
+    console.log('Conectado ao servidor! ID:', socket.id);
+  });
+</script>
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
   html,body{margin:0;padding:0;height:100%;background:#0d1105;overflow:hidden;overscroll-behavior:none;
