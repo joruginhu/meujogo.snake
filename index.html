@@ -1090,10 +1090,91 @@ function setDifficulty(i){
 }
 
 /* ============================================================
+   IA GUARDIÃ — valida mortes antes de aplicá-las
+   Ativa em single player E online. Observa TODAS as cobras
+   (IAs e jogadores). Se uma morte não corresponde a uma colisão
+   real, ela é bloqueada: a cobra não morre e nenhuma tela de
+   morte aparece. Considera "colisão válida":
+     • tocar a borda da arena
+     • cabeça encostar em outra cobra (cabeça ou corpo)
+   NUNCA considera válido morrer pelo próprio corpo.
+   ============================================================ */
+const guardian = {
+  enabled: true,
+  debug: false,
+  blocked: 0,
+  lastBlockT: -10,
+  lastBlockName: '',
+
+  // Verifica se a morte de 's' é realmente válida.
+  // reason: 'border' | 'head' | 'body' | 'unknown'
+  // killer: cobra que causou a morte, ou null
+  // retorna true se a morte deve ser aplicada
+  check: function(s, killer, reason){
+    if(!s || s.dead) return false;
+
+    // borda: valida matematicamente (com pequena folga)
+    if(reason === 'border'){
+      const d2 = s.x * s.x + s.y * s.y;
+      const lim = CFG.R - 0.5;
+      return d2 > lim * lim;
+    }
+
+    // colisão com outra cobra: revalida sobreposição real
+    if(killer && !killer.dead && this.realHit(s, killer)) return true;
+
+    // sem killer declarado (ou killer não bate): varre todas as cobras vivas
+    return this.anyHit(s);
+  },
+
+  // sobreposição real entre a cabeça de 's' e o corpo/cabeça de 'o'
+  realHit: function(s, o){
+    if(!o || o.dead) return false;
+    const pad = 2;                    // mesma tolerância da colisão normal
+    const hth = s.r + o.r - pad;
+    const hdx = o.x - s.x, hdy = o.y - s.y;
+    if(hdx * hdx + hdy * hdy < hth * hth) return true;
+    for(let i = 0; i < o.path.length; i++){
+      const q = o.path[i];
+      const t = o.path.length - 1 - i;
+      const rr = t < 8 ? Math.max(2, Math.round(o.r * (0.55 + 0.45 * t / 8))) : o.r;
+      const tt = s.r + rr - pad;
+      const dx = q.x - s.x, dy = q.y - s.y;
+      if(dx * dx + dy * dy < tt * tt) return true;
+    }
+    return false;
+  },
+
+  // procura qualquer colisão real com qualquer cobra viva
+  anyHit: function(s){
+    for(let i = 0; i < snakes.length; i++){
+      const o = snakes[i];
+      if(o === s || o.dead) continue;
+      if(this.realHit(s, o)) return true;
+    }
+    return false;
+  },
+
+  block: function(s){
+    this.blocked++;
+    this.lastBlockT = tclock;
+    this.lastBlockName = (s && s.name) ? s.name : '';
+    if(this.debug){
+      try{ console.log('[GUARDIAO] morte bloqueada:', this.lastBlockName, 't=' + tclock.toFixed(2)); }catch(e){}
+    }
+  }
+};
+
+/* ============================================================
    COLISÕES / COMER / MORTE
    ============================================================ */
-function killSnake(s, killer){
+function killSnake(s, killer, reason){
   if(s.dead) return;
+  // IA GUARDIÃ: revalida a morte antes de aplicar
+  if(guardian.enabled && !guardian.check(s, killer, reason || 'unknown')){
+    guardian.block(s);
+    return;   // morte cancelada — a cobra continua viva
+  }
   s.dead = true;
   const total = s.mass * 0.8;
   const cnt = Math.max(4, Math.min(110, Math.floor(s.path.length / 2)));
@@ -1130,7 +1211,7 @@ function handleCollisions(){
     const s = snakes[a];
     if(s.dead || s.protect > 0) continue;
     // borda
-    if(s.x * s.x + s.y * s.y > (CFG.R - 1) * (CFG.R - 1)){ killSnake(s, null); continue; }
+    if(s.x * s.x + s.y * s.y > (CFG.R - 1) * (CFG.R - 1)){ killSnake(s, null, 'border'); continue; }
 
     for(let b = 0; b < snakes.length; b++){
       const o = snakes[b];
@@ -1141,7 +1222,7 @@ function handleCollisions(){
 
       const hth = s.r + o.r - 2;
       const hdx = o.x - s.x, hdy = o.y - s.y;
-      if(hdx * hdx + hdy * hdy < hth * hth){ killSnake(s, o); break; }
+      if(hdx * hdx + hdy * hdy < hth * hth){ killSnake(s, o, 'head'); break; }
       let hit = false;
       const n = o.path.length, st = n > 60 ? 2 : 1;
       for(let i = 0; i < n; i += st){
@@ -1152,7 +1233,7 @@ function handleCollisions(){
         const dx = q.x - s.x, dy = q.y - s.y;
         if(dx * dx + dy * dy < tt * tt){ hit = true; break; }
       }
-      if(hit){ killSnake(s, o); break; }
+      if(hit){ killSnake(s, o, 'body'); break; }
     }
   }
 }
@@ -1919,7 +2000,7 @@ function netMessage(data){
       for(let i = 0; i < m.players.length; i++) net.players[m.players[i].id] = m.players[i];
       break;
     case 's': if(online) applySnapshot(m); break;
-    case 'dead': if(online) onlineDead(m); break;
+    case 'dead': if(online) handleDead(m); break;
     case 'kill':
       killMsg = 1.6; killMsgText = 'ELIMINADO ' + m.name; sfxKill();
       break;
@@ -1988,6 +2069,25 @@ function leaveOnline(silent){
   CFG.R = BASE_R;
   net.snakes = new Map(); net.foodMap = new Map(); net.players = {}; net.id = null;
   resetWorld(false);
+}
+
+function handleDead(m){
+  // IA GUARDIÃ: tenta validar a morte antes de aplicar (modo online)
+  if(guardian.enabled && online){
+    const me = net.snakes.get(net.id);
+    if(me){
+      const kId = (typeof m.killer === 'number') ? m.killer : null;
+      const killer = (kId != null) ? net.snakes.get(kId) : null;
+      const reason = m.reason || 'unknown';
+      if(!guardian.check(me, killer, reason)){
+        guardian.block(me);
+        // morte inválida: ignora tela de morte e pede respawn imediato
+        netSend({t: 'respawn'});
+        return;
+      }
+    }
+  }
+  onlineDead(m);
 }
 
 function onlineDead(m){
@@ -2277,75 +2377,4 @@ function joinClick(p){
   const L = joinLayout();
   if(hitRect(p, L.fx, L.py + L.fieldY, L.fw, 13)) focusField('jpass');
   else if(hitRect(p, L.bx1, L.py + L.btnY, L.bw, 13)) submitJoin();
-  else if(hitRect(p, L.bx2, L.py + L.btnY, L.bw, 13)){ nameEl.blur(); mode = 'lobby'; formErr = ''; }
-  else nameEl.blur();
-}
-
-function submitJoin(){
-  if(!joinTarget) return;
-  if(!fval.jpass){ formErr = 'DIGITE A SENHA'; return; }
-  formErr = '';
-  netSend({ t: 'join', id: joinTarget.id, pass: fval.jpass, nick: getName() });
-}
-
-function drawJoin(){
-  const L = joinLayout();
-  panel(L.px, L.py, L.pw, L.ph, 'rgba(165,201,58,0.95)');
-  const title = 'SALA PRIVADA';
-  const tw = 7 + 4 + textWidth(title, 1);
-  const tx = Math.round(W / 2 - tw / 2);
-  drawLock(tx, L.py + L.titleY - 1, true, PAL.DARK);
-  drawText(title, tx + 11, L.py + L.titleY, PAL.DARK, 1);
-  if(joinTarget) drawTextC(joinTarget.name, W / 2, L.py + L.nameY, PAL.TXT2, 1);
-  drawField(L.fx, L.py + L.fieldY, L.fw, 'jpass', 'SENHA', true);
-  if(formErr) drawTextC(formErr, W / 2, L.py + L.errY, PAL.DARK, 1);
-  drawBtn(L.bx1, L.py + L.btnY, L.bw, 'ENTRAR', true);
-  drawBtn(L.bx2, L.py + L.btnY, L.bw, 'CANCELAR', false);
-}
-
-function render(){
-  const shake = (mode === 'dead' && deadT < 0.45);
-  if(shake){
-    const m = 4 * (1 - deadT / 0.45);
-    ctx.save();
-    ctx.translate(Math.round((Math.random() - 0.5) * 2 * m), Math.round((Math.random() - 0.5) * 2 * m));
-  }
-  drawArena();
-  drawFood();
-
-  for(let i = 0; i < snakes.length; i++){
-    const s = snakes[i];
-    if(!s.dead && !s.isPlayer) drawSnake(s);
-  }
-  if(player && !player.dead) drawSnake(player);
-  drawParticles();
-
-  if(mode === 'play'){
-    drawHUD();
-    if(online && W >= 230) drawTextC(net.roomName, W / 2, 3, PAL.TXT2, 1);
-  }
-  if(mode === 'menu') drawMenu();
-  else if(mode === 'lobby') drawLobby();
-  else if(mode === 'create') drawCreate();
-  else if(mode === 'joinpass') drawJoin();
-  if(shake) ctx.restore();
-  if(mode === 'dead') drawDead();
-
-  if(flash > 0){
-    ctx.fillStyle = 'rgba(223,240,160,' + Math.max(0, Math.min(0.85, flash * 2.4)) + ')';
-    ctx.fillRect(0, 0, W, H);
-  }
-}
-
-/* ============================================================
-   BOOT
-   ============================================================ */
-resize();
-resetWorld(false);
-cam.x = 0; cam.y = 0;
-requestAnimationFrame(loop);
-
-})();
-</script>
-</body>
-</html>
+ 
