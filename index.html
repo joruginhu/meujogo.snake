@@ -312,6 +312,10 @@ const VERSION = 'V3.0';
 const SNAKE_COLORS = ['#1f2b06', '#c0281f', '#1f55c8', '#e07a14', '#7b2fbf', '#0f7f86', '#b5306f', '#6b4a2b', '#c9a010', '#2f8f3a'];
 const SNAKE_COLOR_NAMES = ['VERDE', 'VERMELHO', 'AZUL', 'LARANJA', 'ROXO', 'TURQUESA', 'ROSA', 'MARROM', 'DOURADO', 'VERDE FOLHA'];
 let myColor = 0;
+/* ---- loja / moedas ---- */
+let coins = 0, coinPeak = 0, coinPaid = 0, coinMsg = 0, coinMsgText = '';
+let owned = {}, equipped = {};
+let shopPage = 0, shopMsg = '', shopMsgT = 0;
 let paused = false;                      // pausa automática quando a janela perde o foco (modo offline)
 let deathBy = '', deathX = 0, deathY = 0;  // o que matou o jogador e onde
 
@@ -324,7 +328,7 @@ const IS_COARSE = (function(){
 })();
 
 function savePrefs(){
-  try{ localStorage.setItem('snakeio_prefs', JSON.stringify({ n: playerName, c: myColor, d: difficulty })); }catch(e){}
+  try{ localStorage.setItem('snakeio_prefs', JSON.stringify({ n: playerName, c: myColor, d: difficulty, k: coins, o: Object.keys(owned), e: Object.keys(equipped) })); }catch(e){}
 }
 function loadPrefs(){
   try{
@@ -333,6 +337,9 @@ function loadPrefs(){
     if(typeof o.n === 'string') playerName = o.n.toUpperCase().replace(/[^A-Z0-9 ._\-]/g, '').slice(0, 10);
     if(o.c >= 0 && o.c < SNAKE_COLORS.length) myColor = o.c | 0;
     if(o.d >= 0 && o.d <= 2) difficulty = o.d | 0;
+    if(o.k >= 0) coins = Math.floor(o.k);
+    if(Array.isArray(o.o)) o.o.forEach(function(id){ if(typeof id === 'string') owned[id] = true; });
+    if(Array.isArray(o.e)) o.e.forEach(function(id){ if(typeof id === 'string' && owned[id]) equipped[id] = true; });
   }catch(e){}
 }
 
@@ -538,7 +545,7 @@ function focusField(k){
   try{ nameEl.focus({preventScroll:true}); }catch(e){ nameEl.focus(); }
 }
 function fieldFocused(k){ return activeField === k && document.activeElement === nameEl; }
-function isFormMode(){ return mode === 'menu' || mode === 'lobby' || mode === 'create' || mode === 'joinpass'; }
+function isFormMode(){ return mode === 'menu' || mode === 'lobby' || mode === 'create' || mode === 'joinpass' || mode === 'shop'; }
 
 function closeGame(){
   try{ window.close(); }catch(e){}
@@ -590,6 +597,7 @@ cv.addEventListener('click', function(e){
   else if(mode === 'lobby') lobbyClick(p);
   else if(mode === 'create') createClick(p);
   else if(mode === 'joinpass') joinClick(p);
+  else if(mode === 'shop') shopClick(p);
 });
 
 cv.addEventListener('wheel', function(e){
@@ -662,7 +670,7 @@ function formEnter(){
   else if(mode === 'joinpass') submitJoin();
 }
 function formEscape(){
-  if(mode === 'lobby') mode = 'menu';
+  if(mode === 'lobby' || mode === 'shop') mode = 'menu';
   else if(mode === 'create' || mode === 'joinpass'){ mode = 'lobby'; formErr = ''; }
 }
 
@@ -688,6 +696,7 @@ function startGame(){
   paused = false;
   savePrefs();
   resetWorld(true);
+  coinPeak = 0; coinPaid = 0;
   mode = 'play';
   deadT = 0;
   flash = 0;
@@ -1321,6 +1330,7 @@ function killSnake(s, killer){
     sfxKill();
   }
   if(s.isPlayer){
+    coinPeak = 0; coinPaid = 0;
     mode = 'dead';
     deadT = 0;
     flash = 0.35;
@@ -1420,6 +1430,9 @@ function update(dt){
   if(GUARD.notice > 0) GUARD.notice -= dt;
   if(flash > 0) flash -= dt;
   if(killMsg > 0) killMsg -= dt;
+  if(coinMsg > 0) coinMsg -= dt;
+  if(shopMsgT > 0) shopMsgT -= dt;
+  updateCoins();
   if(online){
     netUpdate(dt);
     if(mode === 'dead') deadT += dt;
@@ -1568,44 +1581,593 @@ function drawFood(){
   }
 }
 
+/* ============================================================
+   COSMÉTICOS (acessórios e skins) — tudo desenhado em pixel art
+   ============================================================ */
+const NO_COS = {};
+/* o que a cobra está vestindo: você usa o que equipou; as outras cobras não usam nada */
+function cosOf(s){ return s.cosPreview || (s.isPlayer ? equipped : NO_COS); }
+
+function pix(x, y, c){ ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function onScr(x, y){ return x > -14 && x < W + 14 && y > -14 && y < H + 14; }
+
+/* sprite em texto: '.' = transparente, cada letra = uma cor da paleta */
+function drawSprite(rows, pal, x, y, k){
+  for(let r = 0; r < rows.length; r++){
+    const row = rows[r];
+    let c = 0;
+    while(c < row.length){
+      const ch = row[c];
+      if(ch === '.'){ c++; continue; }
+      let e = c + 1;
+      while(e < row.length && row[e] === ch) e++;
+      ctx.fillStyle = pal[ch];
+      ctx.fillRect(x + c * k, y + r * k, (e - c) * k, k);
+      c = e;
+    }
+  }
+}
+
+/* sprite girado em torno de (cx,cy): a coluna do sprite aponta para onde a cobra olha (ang).
+   vTop = distância (para "baixo" do sprite) do centro até a primeira linha. */
+function drawSpriteRot(rows, pal, cx, cy, ang, k, vTop){
+  const h = rows.length, w = rows[0].length;
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  const hw = w * k / 2, vBot = vTop + h * k;
+  const rad = Math.ceil(Math.hypot(hw, Math.max(Math.abs(vTop), Math.abs(vBot)))) + 1;
+  const x0 = Math.round(cx), y0 = Math.round(cy);
+  let last = null;
+  for(let dy = -rad; dy <= rad; dy++){
+    for(let dx = -rad; dx <= rad; dx++){
+      const u = dx * ca + dy * sa, v = -dx * sa + dy * ca;
+      if(u < -hw || u >= hw || v < vTop || v >= vBot) continue;
+      const ch = rows[Math.floor((v - vTop) / k)][Math.floor((u + hw) / k)];
+      if(ch === '.') continue;
+      const col = pal[ch];
+      if(col !== last){ ctx.fillStyle = col; last = col; }
+      ctx.fillRect(x0 + dx, y0 + dy, 1, 1);
+    }
+  }
+}
+
+/* ângulo "preguiçoso" do chapéu: ele acompanha a cabeça com um pequeno atraso e balança nas curvas */
+function hatAngle(s){
+  if(!s.fx) s.fx = {};
+  let a = s.fx.ha;
+  if(a === undefined) a = s.angle;
+  const d = Math.atan2(Math.sin(s.angle - a), Math.cos(s.angle - a));
+  a += d * 0.3;
+  s.fx.ha = a;
+  return a;
+}
+
+/* linha de pixels (Bresenham) com espessura t, centrada */
+function pline(x0, y0, x1, y1, col, t){
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  t = t || 1;
+  const o = t >> 1;
+  ctx.fillStyle = col;
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+  const stx = x0 < x1 ? 1 : -1, sty = y0 < y1 ? 1 : -1;
+  let err = dx + dy, g = 0;
+  while(g++ < 500){
+    ctx.fillRect(x0 - o, y0 - o, t, t);
+    if(x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if(e2 >= dy){ err += dy; x0 += stx; }
+    if(e2 <= dx){ err += dx; y0 += sty; }
+  }
+}
+
+/* triângulo preenchido, linha a linha (pixelado) */
+function fillTri(x0, y0, x1, y1, x2, y2, col){
+  ctx.fillStyle = col;
+  const X = [x0, x1, x2], Y = [y0, y1, y2];
+  const ymin = Math.floor(Math.min(y0, y1, y2)), ymax = Math.ceil(Math.max(y0, y1, y2));
+  for(let y = ymin; y <= ymax; y++){
+    const yy = y + 0.5;
+    let xa = 1e9, xb = -1e9;
+    for(let e = 0; e < 3; e++){
+      const ax = X[e], ay = Y[e], bx = X[(e + 1) % 3], by = Y[(e + 1) % 3];
+      if((ay <= yy && by > yy) || (by <= yy && ay > yy)){
+        const x = ax + (yy - ay) * (bx - ax) / (by - ay);
+        if(x < xa) xa = x;
+        if(x > xb) xb = x;
+      }
+    }
+    if(xb >= xa){
+      const a = Math.round(xa), b = Math.round(xb);
+      ctx.fillRect(a, y, Math.max(1, b - a), 1);
+    }
+  }
+}
+
+/* posição (na tela) e direção do nó i do corpo; dx,dy aponta para a cabeça */
+function nodeFrame(s, i){
+  const p = s.path, n = p.length;
+  const a = p[Math.max(0, i - 1)], b = p[Math.min(n - 1, i + 1)], c = p[i];
+  let dx = a.x - b.x, dy = a.y - b.y;
+  const d = Math.hypot(dx, dy) || 1;
+  dx /= d; dy /= d;
+  return { x: sx(c.x), y: sy(c.y), dx: dx, dy: dy, px: -dy, py: dx };
+}
+
+/* corrente que "segue" a cabeça (cabelo e capa balançam com o movimento) */
+function fxChain(s, key, ax, ay, dx, dy, seg, N){
+  if(!s.fx) s.fx = {};
+  let ch = s.fx[key];
+  if(!ch || ch.length !== N || Math.hypot(ch[0].x - ax, ch[0].y - ay) > 60){
+    ch = [];
+    for(let i = 0; i < N; i++) ch.push({ x: ax - dx * seg * i, y: ay - dy * seg * i });
+    s.fx[key] = ch;
+  }
+  ch[0].x = ax; ch[0].y = ay;
+  for(let i = 1; i < N; i++){
+    const a = ch[i - 1], b = ch[i];
+    const ddx = a.x - b.x, ddy = a.y - b.y, d = Math.hypot(ddx, ddy);
+    if(d > seg){ const k = (d - seg) / d; b.x += ddx * k; b.y += ddy * k; }
+  }
+  return ch;
+}
+
+/* ---------- sprites (acessórios de cabeça) ---------- */
+const SPR = {
+  santa: { pal: { R: '#c0281f', D: '#8a1a14', W: '#f4f4ea', w: '#cfcfbc' }, rows: [
+    '.....WW.....',
+    '....WWWW....',
+    '....RRRR....',
+    '...RRRRRD...',
+    '..RRRRRRRD..',
+    '.RRRRRRRRRD.',
+    'WWWWWWWWWWWW',
+    'wWwWwWwWwWwW'
+  ]},
+  cap: { pal: { B: '#2a64d8', L: '#6a9af0', K: '#10244f' }, rows: [
+    '...BLLBBBB..',
+    '..BBBBBBBB..',
+    '.BBBBBBBBBB.',
+    'KKKKKKKKKKKK',
+    '........KKKK'
+  ]},
+  cowboy: { pal: { N: '#9a6a2c', n: '#5e3a14', Y: '#e8c050' }, rows: [
+    '....NNNNN....',
+    '...NNNnNNN...',
+    '...NNNnNNN...',
+    '...NYYYYYN...',
+    'N.NNNNNNNNN.N',
+    'nNNNNNNNNNNNn',
+    '.nnnnnnnnnnn.'
+  ]},
+  book: { pal: { R: '#a02020', r: '#701414', Y: '#e8c040', W: '#f4f0dc', w: '#c8c4a8' }, rows: [
+    'rRRRRRRRRRR',
+    'rRRYYYYYRRR',
+    'rRRRRRRRRRR',
+    'rRRYYYYRRRR',
+    'rRRRRRRRRRR',
+    'rRRRRRRRRRR',
+    'WWWWWWWWWWW',
+    'wwwwwwwwwww'
+  ]}
+};
+const DECAL_PAL = { W: '#f8f8f0', R: '#c0281f' };
+const STAR5 = ['..W..', '.WWW.', 'WWWWW', '.WWW.', '.W.W.'];
+const STAR11 = [   // estrela com PT dentro
+  '.....W.....',
+  '....WWW....',
+  '....WWW....',
+  'WWWWWWWWWWW',
+  '.WRRRWRRRW.',
+  '.WRRWWWRWW.',
+  '.WRWWWWRWW.',
+  '..WWWWWWW..',
+  '..WWW.WWW..',
+  '.WWW...WWW.',
+  '.WW.....WW.'
+];
+const DIGIT2 = ['###', '..#', '###', '#..', '###'];
+
+function hatId(cs){ return cs.santa ? 'santa' : cs.cap ? 'cap' : cs.cowboy ? 'cowboy' : cs.book ? 'book' : null; }
+/* altura total do chapéu acima do centro da cabeça (0 = sem chapéu) */
+function hatHeight(cs, R){
+  const id = hatId(cs);
+  if(!id) return 0;
+  return Math.round(R * 0.55) + SPR[id].rows.length * (R >= 8 ? 2 : 1);
+}
+function drawHeadgear(s, cs, hx, hy, R){
+  const id = hatId(cs);
+  if(!id) return;
+  const sp = SPR[id], k = R >= 8 ? 2 : 1;
+  const h = sp.rows.length;
+  drawSpriteRot(sp.rows, sp.pal, hx, hy, hatAngle(s), k, -Math.round(R * 0.55) - h * k);
+}
+
+/* coroa de espinhos: anel trançado em volta da cabeça, com espinhos e gotas de sangue */
+function drawThorns(hx, hy, R){
+  const rr = R + 1, steps = Math.max(18, Math.round(rr * 7));
+  const t = R >= 7 ? 2 : 1;
+  for(let k = 0; k < steps; k++){
+    const a = k / steps * Math.PI * 2;
+    const w = rr + Math.sin(a * 5) * 0.9;
+    ctx.fillStyle = (k % 2) ? '#7a5028' : '#4a2c12';
+    ctx.fillRect(Math.round(hx + Math.cos(a) * w), Math.round(hy + Math.sin(a) * w), t, t);
+    if(k % 5 === 2){
+      ctx.fillStyle = '#2e1a0a';
+      ctx.fillRect(Math.round(hx + Math.cos(a) * (w + 1.7)), Math.round(hy + Math.sin(a) * (w + 1.7)), 1, 1);
+    }
+    if(k === 3 || k === Math.floor(steps * 0.6)){
+      ctx.fillStyle = '#c01818';
+      ctx.fillRect(Math.round(hx + Math.cos(a) * (w - 1.6)), Math.round(hy + Math.sin(a) * (w - 1.6)), 1, 1);
+    }
+  }
+}
+
+/* óculos de nerd: aros claros com lente azulada, ponte com fita e hastes (desenhado ANTES dos olhos) */
+function drawGlasses(R, es, e1x, e1y, e2x, e2y, ca, sa){
+  const g = Math.max(3, es + 2), h = g >> 1, c = '#f4f4e6';
+  const pts = [[e1x, e1y], [e2x, e2y]];
+  for(let k = 0; k < 2; k++){
+    const x = Math.round(pts[k][0]) - h, y = Math.round(pts[k][1]) - h;
+    ctx.fillStyle = '#8fc8e0'; ctx.fillRect(x, y, g, g);
+    ctx.fillStyle = c;
+    ctx.fillRect(x, y, g, 1); ctx.fillRect(x, y + g - 1, g, 1);
+    ctx.fillRect(x, y, 1, g); ctx.fillRect(x + g - 1, y, 1, g);
+  }
+  const mx = e1x - e2x, my = e1y - e2y, len = Math.hypot(mx, my);
+  if(len < 0.5) return;
+  const lx = mx / len, ly = my / len;
+  pline(e1x - lx * h, e1y - ly * h, e2x + lx * h, e2y + ly * h, c, 1);
+  pix((e1x + e2x) / 2, (e1y + e2y) / 2, '#12120c');                   // fitinha na ponte
+  const back = R * 0.9 + 1;
+  pline(e1x + lx * h, e1y + ly * h, e1x + lx * h - ca * back, e1y + ly * h - sa * back, c, 1);
+  pline(e2x - lx * h, e2y - ly * h, e2x - lx * h - ca * back, e2y - ly * h - sa * back, c, 1);
+}
+
+/* máscara da Casa de Papel: rosto claro, bochechas e bigode virado para cima */
+function drawMask(R, hx, hy, ca, sa){
+  const px = -sa, py = ca;
+  if(R >= 4){
+    pix(hx + px * R * 0.7 - ca * R * 0.05, hy + py * R * 0.7 - sa * R * 0.05, '#e0786c');
+    pix(hx - px * R * 0.7 - ca * R * 0.05, hy - py * R * 0.7 - sa * R * 0.05, '#e0786c');
+  }
+  const f = R * 0.82, cx = hx + ca * f, cy = hy + sa * f, wd = R * 0.8;
+  const th = R >= 7 ? 2 : 1;
+  pline(cx - px * wd, cy - py * wd, cx + px * wd, cy + py * wd, '#14100c', th);
+  pline(cx - px * wd, cy - py * wd, cx - px * (wd + 1) - ca * 2, cy - py * (wd + 1) - sa * 2, '#14100c', 1);
+  pline(cx + px * wd, cy + py * wd, cx + px * (wd + 1) - ca * 2, cy + py * (wd + 1) - sa * 2, '#14100c', 1);
+}
+
+/* cabelo longo: três mechas de cada lado, em leque, que balançam atrás da cabeça */
+function drawHair(s, R){
+  const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
+  const seg = 2 + R * 0.2, N = 10, t = Math.max(2, Math.round(R * 0.3));
+  for(let side = -1; side <= 1; side += 2){
+    const ax = s.x - ca * R * 0.15 - sa * side * R * 0.75;
+    const ay = s.y - sa * R * 0.15 + ca * side * R * 0.75;
+    const ch = fxChain(s, 'h' + side, ax, ay, ca, sa, seg, N);
+    for(let k = -1; k <= 1; k++){
+      let x0 = sx(ch[0].x), y0 = sy(ch[0].y);
+      const len = k === 0 ? N : N - 2;
+      for(let i = 1; i < len; i++){
+        const a = ch[i - 1], b = ch[i];
+        const ddx = a.x - b.x, ddy = a.y - b.y, d = Math.hypot(ddx, ddy) || 1;
+        const w = Math.sin(tclock * 7 + i * 0.9 + side) * 0.2 * i + k * R * 0.3 * (0.5 + i * 0.12);   // balanço + leque
+        const nx = sx(b.x) - ddy / d * w, ny = sy(b.y) + ddx / d * w;
+        pline(x0, y0, nx, ny, (k === 0) ? '#8a5428' : ((i % 2) ? '#a06a32' : '#b27a3c'), t);
+        x0 = nx; y0 = ny;
+      }
+    }
+  }
+}
+
+/* capa de super-herói: tecido que flutua atrás da cobra */
+function drawCape(s, R){
+  const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
+  const px = -sa, py = ca, N = 7, seg = 2.2 + R * 0.32;
+  const P = { '-1': [], '1': [] };
+  for(let side = -1; side <= 1; side += 2){
+    const ax = s.x - ca * R * 0.3 - sa * side * R * 0.9;
+    const ay = s.y - sa * R * 0.3 + ca * side * R * 0.9;
+    const ch = fxChain(s, 'c' + side, ax, ay, ca, sa, seg, N);
+    for(let i = 0; i < N; i++){
+      const open = i * (0.45 + R * 0.05) * side;                      // a capa abre para trás
+      const wave = Math.sin(tclock * 6 + i * 0.8) * 0.25 * i;
+      P[side].push([sx(ch[i].x) + px * (open + wave), sy(ch[i].y) + py * (open + wave)]);
+    }
+  }
+  const A = P['-1'], B = P['1'];
+  for(let i = 0; i < N - 1; i++){
+    const c = (i % 2) ? '#a82019' : '#c0281f';
+    fillTri(A[i][0], A[i][1], B[i][0], B[i][1], A[i + 1][0], A[i + 1][1], c);
+    fillTri(B[i][0], B[i][1], B[i + 1][0], B[i + 1][1], A[i + 1][0], A[i + 1][1], c);
+  }
+  for(let i = 0; i < N - 1; i++){
+    pline(A[i][0], A[i][1], A[i + 1][0], A[i + 1][1], '#701210', 1);
+    pline(B[i][0], B[i][1], B[i + 1][0], B[i + 1][1], '#701210', 1);
+  }
+  pline(A[N - 1][0], A[N - 1][1], B[N - 1][0], B[N - 1][1], '#701210', 1);
+  pix(A[0][0], A[0][1], '#f0c030'); pix(B[0][0], B[0][1], '#f0c030');   // fecho dourado
+}
+
+function flame(x, y, h){
+  for(let k = 0; k < h; k++){
+    const w = k < h * 0.35 ? 3 : (k < h * 0.7 ? 2 : 1);
+    ctx.fillStyle = k < h * 0.3 ? '#d02010' : (k < h * 0.65 ? '#ff8a1a' : '#ffe040');
+    ctx.fillRect(Math.round(x) - (w >> 1), Math.round(y) - k, w, 1);
+  }
+}
+
+function drawWings(s, R, idx, colA, colRib){
+  const n = s.path.length;
+  const f = nodeFrame(s, Math.min(idx, n - 3));
+  if(!onScr(f.x, f.y)) return;
+  const fl = 0.7 + 0.3 * Math.sin(tclock * 8), len = R * 2.6;
+  for(let side = -1; side <= 1; side += 2){
+    const tx = f.x + f.px * side * len * fl - f.dx * R * 0.8, ty = f.y + f.py * side * len * fl - f.dy * R * 0.8;
+    const bx = f.x - f.dx * R * 2.8 + f.px * side * R * 0.7, by = f.y - f.dy * R * 2.8 + f.py * side * R * 0.7;
+    fillTri(f.x, f.y, tx, ty, bx, by, colA);
+    pline(f.x, f.y, tx, ty, colRib, 1);
+    pline(tx, ty, bx, by, colRib, 1);
+    pline(f.x, f.y, (tx + bx) / 2, (ty + by) / 2, colRib, 1);
+  }
+}
+
+/* roupas cobrem só os primeiros nós (a parte de trás do corpo continua da cor da cobra) */
+function cloth(len, fn){ return function(i, n){ return i < len ? fn(i, n) : null; }; }
+
+const DIGITS22 = DIGIT2.map(function(r){ return r + '.' + r; });
+function decalAt(s, idx, R, kind){
+  const n = s.path.length;
+  const f = nodeFrame(s, Math.min(idx, n - 3));
+  if(!onScr(f.x, f.y)) return;
+  const ang = Math.atan2(f.dy, f.dx);          // gira junto com o corpo
+  if(kind === 'pt'){
+    if(R >= 5) drawSpriteRot(STAR11, DECAL_PAL, f.x, f.y, ang, 1, -5.5);
+    else drawSpriteRot(STAR5, DECAL_PAL, f.x, f.y, ang, 1, -2.5);
+  } else if(R >= 5){
+    const k = R >= 8 ? 2 : 1;
+    drawSpriteRot(DIGITS22, { '#': '#1f8f3a' }, f.x, f.y, ang, k, -2.5 * k);
+  }
+}
+
+/* ---------- skins ---------- */
+const SKINS = {
+  skel: {
+    head: '#ebe7d2', eye: 'socket',
+    body: function(i){ return (i % 3 === 2) ? '#3e3e30' : '#ebe7d2'; },
+    front: function(s, hx, hy, R, ca, sa){
+      const px = -sa, py = ca, f = R * 0.85, m = Math.floor(R * 0.6);
+      for(let t = -m; t <= m; t++) if(t % 2 === 0) pix(hx + ca * f + px * t, hy + sa * f + py * t, '#2a2a20');
+    }
+  },
+  croc: {
+    head: '#3f7a2a', eye: 'yellow',
+    body: function(i){ const m = i % 4; return m === 0 ? '#2b5a1c' : (m === 2 ? '#4b8a32' : '#3f7a2a'); },
+    over: function(s, n, R){
+      for(let i = 2; i < n - 4; i += 3){
+        const f = nodeFrame(s, i);
+        if(!onScr(f.x, f.y)) continue;
+        pix(f.x + f.px * R * 0.45, f.y + f.py * R * 0.45, '#1f4012');
+        pix(f.x - f.px * R * 0.45, f.y - f.py * R * 0.45, '#1f4012');
+        pix(f.x, f.y, '#6aa84a');
+      }
+    },
+    front: function(s, hx, hy, R, ca, sa){
+      const rr = Math.max(2, Math.round(R * 0.7)), px = -sa, py = ca;
+      const fx = hx + ca * R * 0.95, fy = hy + sa * R * 0.95;
+      ctx.drawImage(discSprite('#3f7a2a', rr), Math.round(fx) - rr, Math.round(fy) - rr);
+      for(let side = -1; side <= 1; side += 2){
+        pix(fx + px * side * rr * 0.95 - ca, fy + py * side * rr * 0.95 - sa, '#f4f4e6');     // dentes
+        pix(fx + px * side * rr * 0.95 + ca, fy + py * side * rr * 0.95 + sa, '#f4f4e6');
+        pix(fx + ca * rr * 0.85 + px * side, fy + sa * rr * 0.85 + py * side, '#14260c');    // narinas
+      }
+    }
+  },
+  dragon: {
+    head: '#b52a1a', eye: 'yellow',
+    body: function(i){ return (i % 4 < 2) ? '#b52a1a' : '#9a2014'; },
+    over: function(s, n, R){
+      drawWings(s, R, 8, '#7a1410', '#3a0a08');
+      for(let i = 3; i < n - 3; i += 3){
+        const f = nodeFrame(s, i);
+        if(!onScr(f.x, f.y)) continue;
+        pix(f.x, f.y, '#f0c030');
+        if(R >= 5 && i < 40) pix(f.x - f.dx, f.y - f.dy, '#f0c030');
+      }
+    },
+    behind: function(s, hx, hy, R, ca, sa){
+      const px = -sa, py = ca;
+      for(let side = -1; side <= 1; side += 2){
+        pline(hx + px * side * R * 0.6, hy + py * side * R * 0.6,
+              hx + px * side * R * 1.7 - ca * R * 0.8, hy + py * side * R * 1.7 - sa * R * 0.8, '#f0d890', R >= 6 ? 2 : 1);
+      }
+    },
+    front: function(s, hx, hy, R, ca, sa){
+      const px = -sa, py = ca;
+      for(let side = -1; side <= 1; side += 2){
+        pline(hx + ca * R * 0.9 + px * side * R * 0.3, hy + sa * R * 0.9 + py * side * R * 0.3,
+              hx + ca * R * 1.8 + px * side * R * 1.3, hy + sa * R * 1.8 + py * side * R * 1.3, '#f4e8b0', 1);
+      }
+    }
+  },
+  robe: {
+    body: cloth(20, function(i){ return (i % 5 === 4) ? '#d9d4c0' : '#f6f3ea'; }),
+    over: function(s, n, R){
+      const a = nodeFrame(s, 3), b = nodeFrame(s, Math.min(10, n - 3));
+      pline(a.x + a.px * R, a.y + a.py * R, b.x - b.px * R, b.y - b.py * R, '#b01818', R >= 6 ? 3 : 2);
+      const h = nodeFrame(s, Math.min(19, n - 3));
+      pix(h.x, h.y, '#d8b040');
+    }
+  },
+  pres: {
+    body: cloth(20, function(i){ return i < 2 ? '#f4f4f0' : ((i % 6 === 5) ? '#3b4468' : '#232a44'); }),
+    over: function(s, n, R){
+      const a = nodeFrame(s, 3), b = nodeFrame(s, Math.min(10, n - 3));
+      const t = R >= 6 ? 3 : 2;
+      pline(a.x + a.px * R, a.y + a.py * R, b.x - b.px * R, b.y - b.py * R, '#f0d020', t + 2);
+      pline(a.x + a.px * R, a.y + a.py * R, b.x - b.px * R, b.y - b.py * R, '#2f9a3a', t);
+      const c = nodeFrame(s, 2);
+      pix(c.x, c.y, '#c0281f');
+      if(R >= 5) pix(c.x - c.dx, c.y - c.dy, '#c0281f');
+    }
+  },
+  orange: {
+    body: cloth(22, function(i){ return (i % 4 < 2) ? '#e8801a' : '#cc6a10'; })
+  },
+  stripe: {
+    body: cloth(22, function(i){ return (i % 4 < 2) ? '#f2f2ea' : '#18181a'; }),
+    front: function(s, hx, hy, R, ca, sa){
+      const px = -sa, py = ca, cx = hx + ca * R * 0.4, cy = hy + sa * R * 0.4;
+      pline(cx - px * R * 0.95, cy - py * R * 0.95, cx + px * R * 0.95, cy + py * R * 0.95, '#101010', R >= 6 ? 4 : (R >= 4 ? 3 : 2));
+    }
+  },
+  pt: {
+    body: cloth(12, function(i){ return i === 11 ? '#8a1a14' : '#c0281f'; }),
+    over: function(s, n, R){ decalAt(s, 6, R, 'pt'); }
+  },
+  n22: {
+    body: cloth(12, function(i){ return (i < 2 || i === 11) ? '#1f8f3a' : '#f0c820'; }),
+    over: function(s, n, R){ decalAt(s, 6, R, '22'); }
+  },
+  water: {
+    head: '#2a8fd0',
+    body: function(i){ return (i % 5 < 2) ? '#2a8fd0' : '#4cb4ea'; },
+    behind: function(s, hx, hy, R, ca, sa){
+      const px = -sa, py = ca;
+      for(let side = -1; side <= 1; side += 2){
+        const bx = hx + px * side * R * 0.5, by = hy + py * side * R * 0.5;
+        fillTri(bx, by, bx + px * side * R * 1.6 - ca * R * 1.3, by + py * side * R * 1.6 - sa * R * 1.3,
+                bx - ca * R * 1.8, by - sa * R * 1.8, '#38c8b8');
+      }
+    },
+    over: function(s, n, R){
+      for(let i = 1; i < n - 6; i += 4){
+        const f = nodeFrame(s, i);
+        if(onScr(f.x, f.y)) pix(f.x, f.y, '#d8f4ff');
+      }
+      const t = nodeFrame(s, n - 1);
+      if(onScr(t.x, t.y)){
+        const L = 3 + R * 1.2;
+        fillTri(t.x, t.y, t.x - t.dx * L + t.px * L * 0.6, t.y - t.dy * L + t.py * L * 0.6,
+                t.x - t.dx * L - t.px * L * 0.6, t.y - t.dy * L - t.py * L * 0.6, '#f4a0b8');
+      }
+    }
+  },
+  stone: {
+    head: '#8e8e88',
+    body: function(i){ if(i % 3 === 0) return '#4a4a46'; return (Math.floor(i / 3) % 2) ? '#74746f' : '#8e8e88'; },
+    over: function(s, n, R){
+      for(let i = 1; i < n - 2; i += 3){
+        const f = nodeFrame(s, i);
+        if(!onScr(f.x, f.y)) continue;
+        pix(f.x - R * 0.3, f.y - R * 0.35, '#b8b8b0');
+        pix(f.x - R * 0.3 + 1, f.y - R * 0.35, '#b8b8b0');
+      }
+    },
+    front: function(s, hx, hy, R, ca, sa){
+      const px = -sa, py = ca;
+      pline(hx - ca * R * 0.6 + px * R * 0.4, hy - sa * R * 0.6 + py * R * 0.4,
+            hx - ca * R * 0.1 - px * R * 0.3, hy - sa * R * 0.1 - py * R * 0.3, '#4a4a46', 1);
+      pix(hx - R * 0.45, hy - R * 0.45, '#b8b8b0');
+    }
+  },
+  boita: {
+    head: '#ffd84a', eye: 'fire',
+    body: function(i, n){
+      const t = Math.min(1, i / Math.max(20, n * 0.9));
+      return t < 0.25 ? '#ffd84a' : (t < 0.5 ? '#ffa41c' : (t < 0.75 ? '#f06a14' : '#c0281f'));
+    },
+    over: function(s, n, R){
+      const fk = Math.floor(tclock * 12);
+      for(let i = 1; i < n - 1; i += 3){
+        const f = nodeFrame(s, i);
+        if(!onScr(f.x, f.y)) continue;
+        const side = (i % 2) ? 1 : -1;
+        flame(f.x + f.px * side * R * 0.5, f.y + f.py * side * R * 0.5 - R * 0.4, 3 + ((i * 5 + fk) % 4));
+      }
+    },
+    behind: function(s, hx, hy, R, ca, sa){
+      const fk = Math.floor(tclock * 12);
+      flame(hx - 2, hy - R * 0.6, 5 + (fk % 3));
+      flame(hx + 2, hy - R * 0.6, 5 + ((fk + 1) % 3));
+      flame(hx, hy - R * 0.6, 7 + ((fk + 2) % 3));
+    }
+  }
+};
+
+/* ============================================================
+   DESENHO DA COBRA (com skin e acessórios)
+   ============================================================ */
 function drawSnake(s){
   const n = s.path.length;
   const R = s.r;
-  const bb = s.bbox, mg = R + 14;
+  const bb = s.bbox, mg = R + 28;
   if(sx(bb.x1) < -mg || sx(bb.x0) > W + mg || sy(bb.y1) < -mg || sy(bb.y0) > H + mg) return;
+  const cs = cosOf(s);
+  let skin = null;
+  for(const id in SKINS){ if(cs[id]){ skin = SKINS[id]; break; } }
   const blink = (s.protect > 0) && (Math.floor(tclock * 8) % 2 === 0);
   if(blink) ctx.globalAlpha = 0.35;
+
+  const bodyFn = skin && skin.body;
   for(let i = n - 1; i >= 0; i--){
     const nd = s.path[i];
     const px = Math.round(sx(nd.x)), py = Math.round(sy(nd.y));
     if(px < -12 || px > W + 12 || py < -12 || py > H + 12) continue;
     const r = bodyRadiusAt(s, i, n);   // mesmo raio da hitbox
-    ctx.drawImage(discSprite(s.color, r), px - r, py - r);
+    let col = s.color;
+    if(bodyFn){ const c = bodyFn(i, n); if(c) col = c; }
+    ctx.drawImage(discSprite(col, r), px - r, py - r);
   }
+  if(skin && skin.over) skin.over(s, n, R);
+  if(cs.cape) drawCape(s, R);
+  if(cs.hair) drawHair(s, R);
+
   const hx = Math.round(sx(s.x)), hy = Math.round(sy(s.y));
   const hr = headRadius(s);
-  ctx.drawImage(discSprite(s.color, hr), hx - hr, hy - hr);
+  const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
+  if(skin && skin.behind) skin.behind(s, hx, hy, R, ca, sa);
+  const hcol = cs.mask ? '#f1dcbf' : ((skin && skin.head) || s.color);
+  ctx.drawImage(discSprite(hcol, hr), hx - hr, hy - hr);
+  if(skin && skin.front) skin.front(s, hx, hy, R, ca, sa);
+  if(cs.hair){                                   // topo da cabeça coberto de cabelo
+    const hrr = Math.max(2, Math.round(R * 0.8));
+    ctx.drawImage(discSprite('#7a4a22', hrr), Math.round(hx - ca * R * 0.3) - hrr, Math.round(hy - sa * R * 0.3) - hrr);
+  }
 
   // olhos (crescem com a cobra)
-  const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
   const ex = -sa, ey = ca;
   const ox = ca * R * 0.4, oy = sa * R * 0.4;
   const sep = Math.max(2, R * 0.65);
   const es = R >= 6 ? 3 : (R >= 4 ? 2 : 1);
   const e1x = hx + ox + ex * sep, e1y = hy + oy + ey * sep;
   const e2x = hx + ox - ex * sep, e2y = hy + oy - ey * sep;
-  ctx.fillStyle = PAL.LIGHT;
-  if(es === 1){
-    ctx.fillRect(Math.round(e1x), Math.round(e1y), 1, 1);
-    ctx.fillRect(Math.round(e2x), Math.round(e2y), 1, 1);
+  if(cs.nerd) drawGlasses(R, es, e1x, e1y, e2x, e2y, ca, sa);
+  const style = cs.mask ? 'hole' : ((skin && skin.eye) || 'def');
+  if(style === 'socket' || style === 'hole'){
+    const z = Math.max(2, es) + (R >= 6 ? 1 : 0), o = (z - 1) / 2;
+    ctx.fillStyle = style === 'socket' ? '#16160f' : '#1c0f08';
+    ctx.fillRect(Math.round(e1x - o), Math.round(e1y - o), z, z);
+    ctx.fillRect(Math.round(e2x - o), Math.round(e2y - o), z, z);
   } else {
-    const h = (es - 1) / 2;
-    ctx.fillRect(Math.round(e1x - h), Math.round(e1y - h), es, es);
-    ctx.fillRect(Math.round(e2x - h), Math.round(e2y - h), es, es);
-    ctx.fillStyle = PAL.DARK;     // pupila olhando para frente
-    ctx.fillRect(Math.round(e1x + ca * 0.8), Math.round(e1y + sa * 0.8), 1, 1);
-    ctx.fillRect(Math.round(e2x + ca * 0.8), Math.round(e2y + sa * 0.8), 1, 1);
+    const eyeC = style === 'fire' ? '#fff4c0' : (style === 'yellow' ? '#f0d020' : PAL.LIGHT);
+    const pupC = style === 'fire' ? '#d01010' : PAL.DARK;
+    const esz = style === 'fire' ? es + 1 : es;
+    ctx.fillStyle = eyeC;
+    if(esz === 1){
+      ctx.fillRect(Math.round(e1x), Math.round(e1y), 1, 1);
+      ctx.fillRect(Math.round(e2x), Math.round(e2y), 1, 1);
+    } else {
+      const h = (esz - 1) / 2;
+      ctx.fillRect(Math.round(e1x - h), Math.round(e1y - h), esz, esz);
+      ctx.fillRect(Math.round(e2x - h), Math.round(e2y - h), esz, esz);
+      ctx.fillStyle = pupC;     // pupila olhando para frente
+      ctx.fillRect(Math.round(e1x + ca * 0.8), Math.round(e1y + sa * 0.8), 1, 1);
+      ctx.fillRect(Math.round(e2x + ca * 0.8), Math.round(e2y + sa * 0.8), 1, 1);
+    }
   }
+  if(cs.mask) drawMask(R, hx, hy, ca, sa);
+  if(cs.thorns) drawThorns(hx, hy, R);
+  else drawHeadgear(s, cs, hx, hy, R);
 
   // nome
   const ny = hy - 12 - (R - 3);
@@ -1613,7 +2175,8 @@ function drawSnake(s){
     drawTextC(s.name, hx, ny, PAL.DARK, 1);
   }
   if(s.isPlayer && mode === 'play'){
-    drawTextC(s.name, hx, ny, PAL.DARK, 1);
+    const ht = hatHeight(cs, R);
+    drawTextC(s.name, hx, ht ? Math.min(ny, hy - ht - 9) : ny, PAL.DARK, 1);   // nome sobe quando tem chapéu
   }
   if(blink) ctx.globalAlpha = 1;
 }
@@ -1657,6 +2220,7 @@ function drawHUD(){
   if(killMsg > 0){
     drawTextC(killMsgText, W / 2, 40, PAL.DARK, 1);
   }
+  if(coinMsg > 0) drawTextC(coinMsgText, W / 2, 28, PAL.DARK, 1);
 
   drawMinimap();
 
@@ -1927,7 +2491,9 @@ function menuClick(p){
     startGame();
   } else if(hitRect(p, L.bx, L.py + L.multiY, L.bw, 13)){
     openLobby();
-  } else if(hitRect(p, L.bx, L.py + L.closeY, L.bw, 13)){
+  } else if(hitRect(p, L.bx + L.bw - 13, L.py + L.closeY, 13, 13)){
+    openShop();
+  } else if(hitRect(p, L.bx, L.py + L.closeY, L.bw - 17, 13)){
     closeGame();
   } else {
     nameEl.blur();
@@ -1986,8 +2552,222 @@ function drawMenu(){
 
   drawBtn(L.bx, L.py + L.playY, L.bw, 'JOGAR (IA)', true);
   drawBtn(L.bx, L.py + L.multiY, L.bw, 'MULTIPLAYER', false);
-  drawBtn(L.bx, L.py + L.closeY, L.bw, 'FECHAR', false);
-  if(!L.compact) drawTextC(VERSION, W / 2, L.py + L.verY, PAL.TXT2, 1);
+  drawBtn(L.bx, L.py + L.closeY, L.bw - 17, 'FECHAR', false);
+  drawBtn(L.bx + L.bw - 13, L.py + L.closeY, 13, '', false);       // botão da loja
+  drawBits(CART_ICON, L.bx + L.bw - 13 + 1, L.py + L.closeY + 2, PAL.DARK);
+  if(!L.compact) drawTextC(VERSION + '  MOEDAS ' + coins, W / 2, L.py + L.verY, PAL.TXT2, 1);
+}
+
+
+/* ============================================================
+   LOJA
+   ============================================================ */
+/* Ordem de exibição: acessórios (do mais barato ao mais caro) e depois skins (idem).
+   slot: só um item por slot pode ficar equipado ao mesmo tempo. */
+const SHOP_ITEMS = [
+  // ---- acessórios ----
+  { id: 'cap',    name: 'BONE',         price: 10,  slot: 'head' },
+  { id: 'hair',   name: 'CABELO LONGO', price: 25,  slot: 'hair' },
+  { id: 'cape',   name: 'CAPA HEROI',   price: 25,  slot: 'back' },
+  { id: 'nerd',   name: 'OCULOS NERD',  price: 35,  slot: 'face' },
+  { id: 'santa',  name: 'PAPAI NOEL',   price: 35,  slot: 'head' },
+  { id: 'cowboy', name: 'COWBOY',       price: 40,  slot: 'head' },
+  { id: 'book',   name: 'LIVRO',        price: 40,  slot: 'head' },
+  { id: 'mask',   name: 'CASA PAPEL',   price: 50,  slot: 'face' },
+  { id: 'thorns', name: 'COROA ESPIN.', price: 200, slot: 'head' },
+  // ---- skins ----
+  { id: 'pt',     name: 'CAMISA PT',    price: 13,  slot: 'skin' },
+  { id: 'n22',    name: 'CAMISA 22',    price: 22,  slot: 'skin' },
+  { id: 'skel',   name: 'ESQUELETO',    price: 60,  slot: 'skin' },
+  { id: 'croc',   name: 'CROCODILO',    price: 60,  slot: 'skin' },
+  { id: 'dragon', name: 'DRAGAO',       price: 65,  slot: 'skin' },
+  { id: 'pres',   name: 'PRESIDENTE',   price: 75,  slot: 'skin' },
+  { id: 'orange', name: 'PRESO LARAN.', price: 75,  slot: 'skin' },
+  { id: 'stripe', name: 'PRESO LISTR.', price: 75,  slot: 'skin' },
+  { id: 'water',  name: 'COBRA AGUA',   price: 120, slot: 'skin' },
+  { id: 'stone',  name: 'COBRA PEDRA',  price: 120, slot: 'skin' },
+  { id: 'boita',  name: 'BOITATA',      price: 240, slot: 'skin' },
+  { id: 'robe',   name: 'MANTO BRANCO', price: 350, slot: 'skin' }
+];
+
+const CART_ICON = ['##.........', '.#.#######.', '.#.#.#.#.#.', '.#..#####..', '.#..#####..', '..#######..', '...##.##...', '...##.##...'];
+const COIN_ICON = ['.###.', '#...#', '#.#.#', '#...#', '.###.'];
+
+/* 10 moedas a cada 100 de tamanho atingidos na partida (paga assim que passa de cada marca) */
+function updateCoins(){
+  if(mode !== 'play' || !player || player.dead) return;
+  if(player.mass > coinPeak) coinPeak = player.mass;
+  const m = Math.floor(coinPeak / 100);
+  if(m > coinPaid){
+    const add = (m - coinPaid) * 10;
+    coinPaid = m;
+    coins += add;
+    coinMsg = 1.8; coinMsgText = '+' + add + ' MOEDAS';
+    savePrefs();
+    sfxBig();
+  }
+}
+
+function openShop(){
+  nameEl.blur();
+  mode = 'shop';
+  shopPage = 0; shopMsg = ''; shopMsgT = 0;
+  beep(600, 0.04, 0.02);
+}
+
+function shopLayout(){
+  const pw = Math.min(W - 8, 280), px = Math.round((W - pw) / 2);
+  const py = 4, ph = H - 8;
+  const L = { px: px, py: py, pw: pw, ph: ph };
+  L.ts = H < 200 ? 1 : 2;
+  L.titleY = py + 5;
+  L.subY = L.titleY + 7 * L.ts + 3;
+  L.coinY = L.subY + 11;
+  L.gridY = L.coinY + 12;
+  L.backY = py + ph - 6 - 13;
+  L.cols = pw >= 240 ? 3 : 2;
+  L.gap = 4;
+  L.cw = Math.floor((pw - 16 - L.gap * (L.cols - 1)) / L.cols);
+  L.ch = 54;
+  L.rows = Math.max(1, Math.floor((L.backY - 3 - L.gridY + L.gap) / (L.ch + L.gap)));
+  L.per = L.cols * L.rows;
+  L.arrW = 20;
+  L.prevX = px + 8;
+  L.nextX = px + pw - 8 - L.arrW;
+  L.backX = L.prevX + L.arrW + 4;
+  L.backW = L.nextX - 4 - L.backX;
+  return L;
+}
+function shopPages(L){ return Math.max(1, Math.ceil(SHOP_ITEMS.length / L.per)); }
+
+function shopTap(it){
+  if(owned[it.id]){
+    if(equipped[it.id]){
+      equipped[it.id] = false;
+      shopMsg = 'REMOVIDO';
+    } else {
+      for(let i = 0; i < SHOP_ITEMS.length; i++){            // só um item por slot
+        if(SHOP_ITEMS[i].slot === it.slot) equipped[SHOP_ITEMS[i].id] = false;
+      }
+      equipped[it.id] = true;
+      shopMsg = 'EQUIPADO';
+    }
+    beep(520, 0.05, 0.02);
+  } else if(coins >= it.price){
+    coins -= it.price;
+    owned[it.id] = true;
+    for(let i = 0; i < SHOP_ITEMS.length; i++){
+      if(SHOP_ITEMS[i].slot === it.slot) equipped[SHOP_ITEMS[i].id] = false;
+    }
+    equipped[it.id] = true;
+    shopMsg = 'COMPRADO!';
+    sfxBig();
+  } else {
+    shopMsg = 'MOEDAS INSUFICIENTES';
+    beep(150, 0.12, 0.03);
+  }
+  shopMsgT = 1.5;
+  savePrefs();
+}
+
+function shopClick(p){
+  const L = shopLayout();
+  const pages = shopPages(L);
+  if(hitRect(p, L.backX, L.backY, L.backW, 13)){ mode = 'menu'; beep(420, 0.04, 0.02); return; }
+  if(pages > 1){
+    if(hitRect(p, L.prevX, L.backY, L.arrW, 13)){ shopPage = Math.max(0, shopPage - 1); return; }
+    if(hitRect(p, L.nextX, L.backY, L.arrW, 13)){ shopPage = Math.min(pages - 1, shopPage + 1); return; }
+  }
+  for(let i = 0; i < L.per; i++){
+    const it = SHOP_ITEMS[shopPage * L.per + i];
+    if(!it) continue;
+    const x = L.px + 8 + (i % L.cols) * (L.cw + L.gap);
+    const y = L.gridY + Math.floor(i / L.cols) * (L.ch + L.gap);
+    if(hitRect(p, x, y, L.cw, L.ch)){ shopTap(it); return; }
+  }
+}
+
+/* mini-cobra que mostra o item em uso (usa o mesmo desenho do jogo) */
+const PREVIEWS = {};
+function previewSnake(it){
+  let s = PREVIEWS[it.id];
+  if(!s){
+    const path = [];
+    for(let i = 0; i < 24; i++) path.push({ x: -i * CFG.SEG, y: 0 });
+    s = { x: 0, y: 0, angle: 0, r: 6, mass: 60, path: path, boosting: false, protect: 0, dead: false,
+          isPlayer: false, name: '', color: '#1f2b06', bbox: { x0: -50, y0: -12, x1: 0, y1: 12 },
+          cosPreview: {} };
+    s.cosPreview[it.id] = true;
+    PREVIEWS[it.id] = s;
+  }
+  s.color = SNAKE_COLORS[myColor];
+  return s;
+}
+function drawPreview(it, x, y, w){
+  const s = previewSnake(it);
+  const hx = x + Math.round(w * 0.62), hy = y + 19;
+  const ocx = cam.x, ocy = cam.y;
+  cam.x = W / 2 - hx; cam.y = H / 2 - hy;              // coloca a cabeça da mini-cobra no ponto desejado
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x + 1, y + 1, w - 2, 31); ctx.clip();
+  drawSnake(s);
+  ctx.restore();
+  cam.x = ocx; cam.y = ocy;
+}
+
+function fitName(t, maxW){
+  while(t.length > 1 && textWidth(t, 1) > maxW) t = t.slice(0, -1);
+  return t;
+}
+
+function drawShopCell(x, y, w, h, it){
+  panel(x, y, w, h, 'rgba(223,240,160,0.75)');
+  drawPreview(it, x, y, w);
+  drawTextC(fitName(it.name, w - 4), x + w / 2, y + 35, PAL.DARK, 1);
+  if(owned[it.id]){
+    drawTextC(equipped[it.id] ? 'EQUIPADO' : 'USAR', x + w / 2, y + h - 10, equipped[it.id] ? PAL.DARK : PAL.TXT2, 1);
+  } else {
+    const t = String(it.price), tw = textWidth(t, 1) + 7;
+    const x0 = Math.round(x + (w - tw) / 2);
+    drawText(t, x0, y + h - 10, coins >= it.price ? PAL.DARK : PAL.TXT2, 1);
+    drawBits(COIN_ICON, x0 + textWidth(t, 1) + 2, y + h - 10 + 1, PAL.DARK);
+  }
+}
+
+function drawShop(){
+  const L = shopLayout();
+  panel(L.px, L.py, L.pw, L.ph, 'rgba(165,201,58,0.93)');
+  drawTextC('LOJA', W / 2, L.titleY, PAL.DARK, L.ts);
+  drawTextC('GANHE MOEDAS JOGANDO', W / 2, L.subY, PAL.TXT2, 1);
+
+  const ct = 'MOEDAS ' + coins, cw = textWidth(ct, 1) + 8;
+  const cx0 = Math.round((W - cw) / 2);
+  drawBits(COIN_ICON, cx0, L.coinY + 1, PAL.DARK);
+  drawText(ct, cx0 + 8, L.coinY, PAL.DARK, 1);
+
+  const pages = shopPages(L);
+  if(pages > 1){
+    const pt = (shopPage + 1) + '/' + pages;
+    drawText(pt, L.px + L.pw - 8 - textWidth(pt, 1), L.coinY, PAL.TXT2, 1);
+  }
+
+  for(let i = 0; i < L.per; i++){
+    const it = SHOP_ITEMS[shopPage * L.per + i];
+    if(!it) continue;
+    drawShopCell(L.px + 8 + (i % L.cols) * (L.cw + L.gap), L.gridY + Math.floor(i / L.cols) * (L.ch + L.gap), L.cw, L.ch, it);
+  }
+
+  if(shopMsgT > 0){
+    const mw = textWidth(shopMsg, 1) + 8;
+    panel(Math.round((W - mw) / 2), L.backY - 12, mw, 11, 'rgba(223,240,160,0.95)');
+    drawTextC(shopMsg, W / 2, L.backY - 10, PAL.DARK, 1);
+  }
+
+  if(pages > 1){
+    drawBtn(L.prevX, L.backY, L.arrW, '<', false);
+    drawBtn(L.nextX, L.backY, L.arrW, '>', false);
+  }
+  drawBtn(L.backX, L.backY, L.backW, 'VOLTAR', true);
 }
 
 /* ---------- tela de morte: fundo vermelho + caveira de cobra ---------- */
@@ -2248,6 +3028,7 @@ function enterOnline(m){
     net.foodMap.set(f[0], { x: f[1], y: f[2], m: f[3], big: !!f[4] });
   }
   net.lastAngle = null; net.lastBoost = false; net.lastSend = 0; net.camSnap = true;
+  coinPeak = 0; coinPaid = 0;
   snakes = []; food = []; parts = []; floats = []; respawnQ = []; player = null;
   mode = 'play'; deadT = 0; flash = 0; killMsg = 0; formErr = '';
   sfxStart();
@@ -2275,6 +3056,7 @@ function onlineDead(m){
     return;
   }
   GUARD.stats.valid++; GUARD.stats.last = 'OK ' + v.why;
+  coinPeak = 0; coinPaid = 0;
   const ps = net.snakes.get(net.id);
   if(ps){ deathX = ps.x; deathY = ps.y; }
   deathBy = m.by || 'BORDA';
@@ -2622,6 +3404,7 @@ function render(){
   else if(mode === 'lobby') drawLobby();
   else if(mode === 'create') drawCreate();
   else if(mode === 'joinpass') drawJoin();
+  else if(mode === 'shop') drawShop();
   if(shake) ctx.restore();
   if(mode === 'dead') drawDead();
 
